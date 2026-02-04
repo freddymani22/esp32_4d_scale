@@ -20,11 +20,19 @@
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define SOBEL_THRESHOLD     150     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
-#define DILATION_ITERATIONS 2       // Close edge gaps after Sobel (increase if contour has breaks)
+// Chromaticity threshold: how different a pixel's color ratio must be from background
+// Range 0.0-1.0. Lower = more sensitive (detects subtle color differences)
+// Typical values: 0.05-0.15
+#define CHROMA_THRESHOLD    0.08f
+
+#define DILATION_ITERATIONS 2       // Close gaps in detected object mask
+#define EROSION_ITERATIONS  1       // Remove noise specks
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define PIXELS_PER_MM       1.38f   // Calibrate with known object!
-#define RESET_PHOTO_NUMBER  true    // Set to true to always start from 1 (overwrites existing)
+#define RESET_PHOTO_NUMBER  false   // Set to true to always start from 1 (overwrites existing)
+
+// Corner sample size for background detection (samples from all 4 corners)
+#define CORNER_SAMPLE_SIZE  10
 // ===========================================
 
 // AI-Thinker ESP32-CAM Pin Mapping
@@ -63,48 +71,138 @@ typedef struct {
     bool valid;
 } min_area_rect_t;
 
-// ============== STEP 1: SOBEL EDGE DETECTION ==============
+// ============== RGB565 HELPERS ==============
 
-static void apply_sobel(uint8_t *src, uint8_t *dst, int width, int height, int edge_thresh)
+// RGB565 format: RRRRRGGG GGGBBBBB (big-endian in memory on ESP32-CAM)
+static inline void rgb565_to_rgb(uint16_t pixel, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    // Sobel kernels:
-    // Gx: [-1, 0, 1]    Gy: [-1, -2, -1]
-    //     [-2, 0, 2]        [ 0,  0,  0]
-    //     [-1, 0, 1]        [ 1,  2,  1]
-
-    // Border pixels: no edge
-    for (int x = 0; x < width; x++) {
-        dst[x] = 0;
-        dst[(height - 1) * width + x] = 0;
-    }
-    for (int y = 0; y < height; y++) {
-        dst[y * width] = 0;
-        dst[y * width + width - 1] = 0;
-    }
-
-    for (int y = 1; y < height - 1; y++) {
-        for (int x = 1; x < width - 1; x++) {
-            int p00 = src[(y - 1) * width + (x - 1)];
-            int p01 = src[(y - 1) * width +  x];
-            int p02 = src[(y - 1) * width + (x + 1)];
-            int p10 = src[ y      * width + (x - 1)];
-            int p12 = src[ y      * width + (x + 1)];
-            int p20 = src[(y + 1) * width + (x - 1)];
-            int p21 = src[(y + 1) * width +  x];
-            int p22 = src[(y + 1) * width + (x + 1)];
-
-            int gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
-            int gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
-
-            // Manhattan magnitude (avoids sqrt, range 0-2040)
-            int mag = abs(gx) + abs(gy);
-            dst[y * width + x] = (mag > edge_thresh) ? 255 : 0;
-        }
-    }
+    // ESP32-CAM stores RGB565 in big-endian, so swap bytes
+    pixel = (pixel >> 8) | (pixel << 8);
+    *r = (pixel >> 11) & 0x1F;
+    *g = (pixel >> 5) & 0x3F;
+    *b = pixel & 0x1F;
+    // Scale to 0-255
+    *r = (*r << 3) | (*r >> 2);
+    *g = (*g << 2) | (*g >> 4);
+    *b = (*b << 3) | (*b >> 2);
 }
 
-// ============== STEP 1.5: DILATION (Close edge gaps) ==============
-// Dilation expands edge pixels - closes small gaps so contour tracer can follow
+static inline uint16_t rgb_to_rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint16_t pixel = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    // Swap back to big-endian
+    return (pixel >> 8) | (pixel << 8);
+}
+
+// ============== STEP 1: COLOR-BASED OBJECT DETECTION ==============
+// Uses chromaticity (color ratios) which is invariant to shadows.
+// Shadows scale R, G, B proportionally, so r/(r+g+b) stays constant.
+// Objects have different chromaticity than background.
+
+static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width, int height, float chroma_thresh)
+{
+    // Sample background chromaticity from corners
+    float bg_cr = 0, bg_cg = 0;  // background chromaticity (r and g channels, b is implicit)
+    int sample_count = 0;
+
+    // Sample from all 4 corners
+    int corners[4][2] = {
+        {0, 0},                           // top-left
+        {width - CORNER_SAMPLE_SIZE, 0},  // top-right
+        {0, height - CORNER_SAMPLE_SIZE}, // bottom-left
+        {width - CORNER_SAMPLE_SIZE, height - CORNER_SAMPLE_SIZE}  // bottom-right
+    };
+
+    for (int c = 0; c < 4; c++) {
+        int sx = corners[c][0];
+        int sy = corners[c][1];
+        for (int y = sy; y < sy + CORNER_SAMPLE_SIZE && y < height; y++) {
+            for (int x = sx; x < sx + CORNER_SAMPLE_SIZE && x < width; x++) {
+                uint8_t r, g, b;
+                rgb565_to_rgb(rgb565[y * width + x], &r, &g, &b);
+                int sum = r + g + b;
+                if (sum > 30) {  // Skip very dark pixels
+                    bg_cr += (float)r / sum;
+                    bg_cg += (float)g / sum;
+                    sample_count++;
+                }
+            }
+        }
+    }
+
+    if (sample_count > 0) {
+        bg_cr /= sample_count;
+        bg_cg /= sample_count;
+    } else {
+        // Fallback to neutral gray
+        bg_cr = 0.33f;
+        bg_cg = 0.33f;
+    }
+
+    ESP_LOGI(TAG, "Background chromaticity: r=%.3f, g=%.3f (from %d samples)",
+             bg_cr, bg_cg, sample_count);
+
+    // Classify each pixel
+    int object_pixels = 0;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int idx = y * width + x;
+            uint8_t r, g, b;
+            rgb565_to_rgb(rgb565[idx], &r, &g, &b);
+
+            int sum = r + g + b;
+            if (sum < 30) {
+                // Very dark pixel - likely object (or shadow, but we err on side of detection)
+                binary[idx] = 255;
+                object_pixels++;
+            } else {
+                float cr = (float)r / sum;
+                float cg = (float)g / sum;
+
+                // Euclidean distance in chromaticity space
+                float dist = sqrtf((cr - bg_cr) * (cr - bg_cr) + (cg - bg_cg) * (cg - bg_cg));
+
+                if (dist > chroma_thresh) {
+                    binary[idx] = 255;  // Object
+                    object_pixels++;
+                } else {
+                    binary[idx] = 0;    // Background or shadow
+                }
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Detected %d object pixels (%.1f%% of image)",
+             object_pixels, 100.0f * object_pixels / (width * height));
+}
+
+// ============== STEP 1.5: MORPHOLOGICAL OPERATIONS ==============
+
+static void apply_erosion(uint8_t *img, int width, int height, int iterations)
+{
+    uint8_t *temp = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
+    if (!temp) return;
+
+    for (int iter = 0; iter < iterations; iter++) {
+        memcpy(temp, img, width * height);
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x++) {
+                // 3x3 erosion: pixel is white only if ALL neighbors are white
+                int all_white = 1;
+                for (int dy = -1; dy <= 1 && all_white; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (temp[(y + dy) * width + (x + dx)] == 0) {
+                            all_white = 0;
+                            break;
+                        }
+                    }
+                }
+                img[y * width + x] = all_white ? 255 : 0;
+            }
+        }
+    }
+    heap_caps_free(temp);
+}
 
 static void apply_dilation(uint8_t *img, int width, int height, int iterations)
 {
@@ -113,7 +211,6 @@ static void apply_dilation(uint8_t *img, int width, int height, int iterations)
 
     for (int iter = 0; iter < iterations; iter++) {
         memcpy(temp, img, width * height);
-
         for (int y = 1; y < height - 1; y++) {
             for (int x = 1; x < width - 1; x++) {
                 // 3x3 dilation: pixel is white if ANY neighbor is white
@@ -130,7 +227,6 @@ static void apply_dilation(uint8_t *img, int width, int height, int iterations)
             }
         }
     }
-
     heap_caps_free(temp);
 }
 
@@ -164,7 +260,7 @@ static int trace_contour(uint8_t *binary, int width, int height, point_t *contou
 
     int count = 0;
     int x = start_x, y = start_y;
-    int dir = 0;  // Start direction
+    int dir = 0;
 
     do {
         if (count < max_points) {
@@ -173,9 +269,8 @@ static int trace_contour(uint8_t *binary, int width, int height, point_t *contou
             count++;
         }
 
-        // Find next boundary pixel (Moore boundary tracing)
         int found = 0;
-        int start_dir = (dir + 5) % 8;  // Start search from backtrack direction
+        int start_dir = (dir + 5) % 8;
 
         for (int i = 0; i < 8; i++) {
             int check_dir = (start_dir + i) % 8;
@@ -223,7 +318,6 @@ static int convex_hull(point_t *points, int n, point_t *hull)
         return n;
     }
 
-    // Sort points
     qsort(points, n, sizeof(point_t), compare_points);
 
     int k = 0;
@@ -241,7 +335,7 @@ static int convex_hull(point_t *points, int n, point_t *hull)
         hull[k++] = points[i];
     }
 
-    return k - 1;  // Remove last point (same as first)
+    return k - 1;
 }
 
 // ============== STEP 4: ROTATING CALIPERS → MIN AREA RECT ==============
@@ -260,12 +354,10 @@ static min_area_rect_t find_min_area_rect(point_t *hull, int n)
 
     float min_area = 1e18f;
 
-    // Try each edge of hull as base of rectangle
     for (int i = 0; i < n; i++) {
         point_t p1 = hull[i];
         point_t p2 = hull[(i + 1) % n];
 
-        // Edge vector (normalized)
         float ex = p2.x - p1.x;
         float ey = p2.y - p1.y;
         float len = sqrtf(ex * ex + ey * ey);
@@ -273,11 +365,9 @@ static min_area_rect_t find_min_area_rect(point_t *hull, int n)
         ex /= len;
         ey /= len;
 
-        // Perpendicular vector
         float px = -ey;
         float py = ex;
 
-        // Project all points onto edge and perpendicular
         float min_e = 1e18f, max_e = -1e18f;
         float min_p = 1e18f, max_p = -1e18f;
 
@@ -305,13 +395,11 @@ static min_area_rect_t find_min_area_rect(point_t *hull, int n)
             result.height = height;
             result.angle = atan2f(ey, ex) * 180.0f / M_PI;
 
-            // Calculate center
             float center_e = (min_e + max_e) / 2.0f;
             float center_p = (min_p + max_p) / 2.0f;
             result.center.x = p1.x + center_e * ex + center_p * px;
             result.center.y = p1.y + center_e * ey + center_p * py;
 
-            // Calculate corners
             result.corners[0].x = p1.x + min_e * ex + min_p * px;
             result.corners[0].y = p1.y + min_e * ey + min_p * py;
             result.corners[1].x = p1.x + max_e * ex + min_p * px;
@@ -325,7 +413,6 @@ static min_area_rect_t find_min_area_rect(point_t *hull, int n)
         }
     }
 
-    // Ensure width >= height (swap if needed)
     if (result.width < result.height) {
         float tmp = result.width;
         result.width = result.height;
@@ -333,20 +420,18 @@ static min_area_rect_t find_min_area_rect(point_t *hull, int n)
         result.angle += 90.0f;
     }
 
-    // Normalize angle to [-90, 90]
     while (result.angle > 90.0f) result.angle -= 180.0f;
     while (result.angle < -90.0f) result.angle += 180.0f;
 
-    // Convert to mm
     result.width_mm = result.width / PIXELS_PER_MM;
     result.height_mm = result.height / PIXELS_PER_MM;
 
     return result;
 }
 
-// ============== VISUALIZATION: Draw rectangle on image ==============
+// ============== VISUALIZATION: Draw rectangle on RGB565 image ==============
 
-static void draw_line(uint8_t *img, int width, int height, point_t p1, point_t p2, uint8_t color)
+static void draw_line_rgb565(uint16_t *img, int width, int height, point_t p1, point_t p2, uint16_t color)
 {
     int x0 = (int)p1.x, y0 = (int)p1.y;
     int x1 = (int)p2.x, y1 = (int)p2.y;
@@ -366,18 +451,21 @@ static void draw_line(uint8_t *img, int width, int height, point_t p1, point_t p
     }
 }
 
-static void draw_min_area_rect(uint8_t *img, int width, int height, min_area_rect_t *rect)
+static void draw_min_area_rect_rgb565(uint16_t *img, int width, int height, min_area_rect_t *rect)
 {
     if (!rect->valid) return;
 
+    // Bright green color for visibility
+    uint16_t green = rgb_to_rgb565(0, 255, 0);
+
     for (int i = 0; i < 4; i++) {
-        draw_line(img, width, height, rect->corners[i], rect->corners[(i+1)%4], 128);
+        draw_line_rgb565(img, width, height, rect->corners[i], rect->corners[(i+1)%4], green);
     }
 }
 
 // ============== MAIN PROCESSING FUNCTION ==============
 
-static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
+static min_area_rect_t process_image(uint16_t *rgb565, int width, int height)
 {
     min_area_rect_t result = {0};
 
@@ -391,12 +479,14 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
         goto cleanup;
     }
 
-    // Step 1: Sobel edge detection
-    ESP_LOGI(TAG, "Step 1: Sobel edge detection (threshold=%d)...", SOBEL_THRESHOLD);
-    apply_sobel(grayscale, binary, width, height, SOBEL_THRESHOLD);
+    // Step 1: Color-based object detection (shadow-invariant)
+    ESP_LOGI(TAG, "Step 1: Color-based detection (chroma_thresh=%.3f)...", CHROMA_THRESHOLD);
+    detect_object_by_color(rgb565, binary, width, height, CHROMA_THRESHOLD);
 
-    // Step 1.5: Dilation to close edge gaps
-    ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
+    // Step 1.5: Morphological cleanup (erosion removes noise, dilation fills gaps)
+    ESP_LOGI(TAG, "Step 1.5: Morphological cleanup (erosion=%d, dilation=%d)...",
+             EROSION_ITERATIONS, DILATION_ITERATIONS);
+    apply_erosion(binary, width, height, EROSION_ITERATIONS);
     apply_dilation(binary, width, height, DILATION_ITERATIONS);
 
     // Step 2: Trace contour
@@ -416,9 +506,9 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
     ESP_LOGI(TAG, "Step 4: Finding minimum area rectangle...");
     result = find_min_area_rect(hull, hull_count);
 
-    // Draw result on original image
+    // Draw result on original color image
     if (result.valid) {
-        draw_min_area_rect(grayscale, width, height, &result);
+        draw_min_area_rect_rgb565(rgb565, width, height, &result);
     }
 
 cleanup:
@@ -473,7 +563,7 @@ static esp_err_t init_sd_card(void)
 
 static esp_err_t init_camera(void)
 {
-    ESP_LOGI(TAG, "Initializing camera...");
+    ESP_LOGI(TAG, "Initializing camera (RGB565 mode)...");
     camera_config_t config = {
         .ledc_channel = LEDC_CHANNEL_0,
         .ledc_timer = LEDC_TIMER_0,
@@ -494,8 +584,8 @@ static esp_err_t init_camera(void)
         .pin_pwdn = PWDN_GPIO_NUM,
         .pin_reset = RESET_GPIO_NUM,
         .xclk_freq_hz = 20000000,
-        .pixel_format = PIXFORMAT_GRAYSCALE,
-        .frame_size = FRAMESIZE_QVGA,    // 320x240
+        .pixel_format = PIXFORMAT_RGB565,   // COLOR capture
+        .frame_size = FRAMESIZE_QVGA,       // 320x240
         .jpeg_quality = 12,
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_PSRAM,
@@ -507,7 +597,7 @@ static esp_err_t init_camera(void)
         ESP_LOGE(TAG, "Camera init FAILED: 0x%x", err);
         return err;
     }
-    ESP_LOGI(TAG, "Camera ready!");
+    ESP_LOGI(TAG, "Camera ready (RGB565)!");
     return ESP_OK;
 }
 
@@ -522,13 +612,13 @@ static void create_photo_folder(void)
 static int get_next_photo_number(void)
 {
 #if RESET_PHOTO_NUMBER
-    return 1;  // Always start from 1 (overwrites existing files)
+    return 1;
 #else
     char filename[64];
     struct stat st;
     int num = 1;
     while (num < 10000) {
-        snprintf(filename, sizeof(filename), PHOTO_FOLDER "/img%d.pgm", num);
+        snprintf(filename, sizeof(filename), PHOTO_FOLDER "/img%d.ppm", num);
         if (stat(filename, &st) != 0) break;
         num++;
     }
@@ -536,19 +626,31 @@ static int get_next_photo_number(void)
 #endif
 }
 
-static void save_pgm(uint8_t *data, int width, int height, const char *filename)
+// Save RGB565 image as PPM (portable pixmap - color)
+static void save_ppm(uint16_t *rgb565, int width, int height, const char *filename)
 {
     FILE *f = fopen(filename, "wb");
-    if (f) {
-        fprintf(f, "P5\n%d %d\n255\n", width, height);
-        fwrite(data, 1, width * height, f);
-        fflush(f);
-        fsync(fileno(f));
-        fclose(f);
-        ESP_LOGI(TAG, "Saved: %s", filename);
-    } else {
+    if (!f) {
         ESP_LOGE(TAG, "Failed to save: %s (errno=%d: %s)", filename, errno, strerror(errno));
+        return;
     }
+
+    // PPM header
+    fprintf(f, "P6\n%d %d\n255\n", width, height);
+
+    // Convert and write pixel by pixel (to avoid large temporary buffer)
+    for (int i = 0; i < width * height; i++) {
+        uint8_t r, g, b;
+        rgb565_to_rgb(rgb565[i], &r, &g, &b);
+        fputc(r, f);
+        fputc(g, f);
+        fputc(b, f);
+    }
+
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    ESP_LOGI(TAG, "Saved: %s", filename);
 }
 
 // ============== MAIN ==============
@@ -558,7 +660,7 @@ void app_main(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
     ESP_LOGI(TAG, "║   ESP32-CAM Object Measurement        ║");
-    ESP_LOGI(TAG, "║   Min Area Rectangle Detection        ║");
+    ESP_LOGI(TAG, "║   COLOR-BASED Shadow Rejection        ║");
     ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
 
     print_memory_info();
@@ -579,9 +681,9 @@ void app_main(void)
 
     int photo_num = get_next_photo_number();
 
-    // Capture and process
+    // Capture
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> Capturing image...");
+    ESP_LOGI(TAG, ">>> Capturing image (RGB565)...");
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
@@ -589,11 +691,11 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(TAG, "Captured: %dx%d", fb->width, fb->height);
+    ESP_LOGI(TAG, "Captured: %dx%d (%zu bytes)", fb->width, fb->height, fb->len);
 
-    // Copy image to our own buffer (camera buffer can have issues after modification)
-    size_t img_size = fb->width * fb->height;
-    uint8_t *img_copy = heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM);
+    // Copy image (RGB565 = 2 bytes per pixel)
+    size_t img_size = fb->width * fb->height * 2;
+    uint16_t *img_copy = heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM);
     if (!img_copy) {
         ESP_LOGE(TAG, "Failed to allocate image buffer!");
         esp_camera_fb_return(fb);
@@ -603,24 +705,22 @@ void app_main(void)
     int img_width = fb->width;
     int img_height = fb->height;
 
-    // Return camera buffer immediately
     esp_camera_fb_return(fb);
 
-    // Save original (shorter names for FAT compatibility)
+    // Save original
     char filename[64];
-    snprintf(filename, sizeof(filename), PHOTO_FOLDER "/img%d.pgm", photo_num);
-    save_pgm(img_copy, img_width, img_height, filename);
+    snprintf(filename, sizeof(filename), PHOTO_FOLDER "/img%d.ppm", photo_num);
+    save_ppm(img_copy, img_width, img_height, filename);
 
-    // Process: find min area rectangle (this modifies img_copy)
+    // Process
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Processing image...");
     min_area_rect_t rect = process_image(img_copy, img_width, img_height);
 
     // Save processed (with rectangle drawn)
-    snprintf(filename, sizeof(filename), PHOTO_FOLDER "/res%d.pgm", photo_num);
-    save_pgm(img_copy, img_width, img_height, filename);
+    snprintf(filename, sizeof(filename), PHOTO_FOLDER "/res%d.ppm", photo_num);
+    save_ppm(img_copy, img_width, img_height, filename);
 
-    // Free our copy
     heap_caps_free(img_copy);
 
     // Print results
@@ -651,10 +751,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Files saved:");
-    ESP_LOGI(TAG, "  - img%d.pgm  (original)", photo_num);
-    ESP_LOGI(TAG, "  - res%d.pgm  (with rectangle)", photo_num);
+    ESP_LOGI(TAG, "  - img%d.ppm  (original color)", photo_num);
+    ESP_LOGI(TAG, "  - res%d.ppm  (with rectangle)", photo_num);
 
-    // Unmount SD card safely
     esp_vfs_fat_sdcard_unmount("/sdcard", NULL);
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> SD CARD SAFE TO REMOVE! <<<");
