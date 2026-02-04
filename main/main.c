@@ -20,9 +20,8 @@
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define THRESHOLD_VALUE     180     // Pixels darker than this = object (lower = stricter, skips shadows)
-#define EROSION_ITERATIONS  2       // Remove shadows (increase if shadow still detected)
-#define DILATION_ITERATIONS 2       // Restore object size after erosion
+#define SOBEL_THRESHOLD     150     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
+#define DILATION_ITERATIONS 2       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define PIXELS_PER_MM       1.38f   // Calibrate with known object!
 #define RESET_PHOTO_NUMBER  true    // Set to true to always start from 1 (overwrites existing)
@@ -64,48 +63,48 @@ typedef struct {
     bool valid;
 } min_area_rect_t;
 
-// ============== STEP 1: THRESHOLD ==============
+// ============== STEP 1: SOBEL EDGE DETECTION ==============
 
-static void apply_threshold(uint8_t *src, uint8_t *dst, int width, int height, uint8_t thresh)
+static void apply_sobel(uint8_t *src, uint8_t *dst, int width, int height, int edge_thresh)
 {
-    for (int i = 0; i < width * height; i++) {
-        dst[i] = (src[i] < thresh) ? 255 : 0;  // Object = white, BG = black
+    // Sobel kernels:
+    // Gx: [-1, 0, 1]    Gy: [-1, -2, -1]
+    //     [-2, 0, 2]        [ 0,  0,  0]
+    //     [-1, 0, 1]        [ 1,  2,  1]
+
+    // Border pixels: no edge
+    for (int x = 0; x < width; x++) {
+        dst[x] = 0;
+        dst[(height - 1) * width + x] = 0;
     }
-}
+    for (int y = 0; y < height; y++) {
+        dst[y * width] = 0;
+        dst[y * width + width - 1] = 0;
+    }
 
-// ============== STEP 1.5: EROSION (Remove shadows) ==============
-// Erosion shrinks white regions - removes thin shadows while keeping main object
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            int p00 = src[(y - 1) * width + (x - 1)];
+            int p01 = src[(y - 1) * width +  x];
+            int p02 = src[(y - 1) * width + (x + 1)];
+            int p10 = src[ y      * width + (x - 1)];
+            int p12 = src[ y      * width + (x + 1)];
+            int p20 = src[(y + 1) * width + (x - 1)];
+            int p21 = src[(y + 1) * width +  x];
+            int p22 = src[(y + 1) * width + (x + 1)];
 
-static void apply_erosion(uint8_t *img, int width, int height, int iterations)
-{
-    uint8_t *temp = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
-    if (!temp) return;
+            int gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
+            int gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
 
-    for (int iter = 0; iter < iterations; iter++) {
-        memcpy(temp, img, width * height);
-
-        for (int y = 1; y < height - 1; y++) {
-            for (int x = 1; x < width - 1; x++) {
-                // 3x3 erosion: pixel is white only if ALL neighbors are white
-                int all_white = 1;
-                for (int dy = -1; dy <= 1 && all_white; dy++) {
-                    for (int dx = -1; dx <= 1; dx++) {
-                        if (temp[(y + dy) * width + (x + dx)] == 0) {
-                            all_white = 0;
-                            break;
-                        }
-                    }
-                }
-                img[y * width + x] = all_white ? 255 : 0;
-            }
+            // Manhattan magnitude (avoids sqrt, range 0-2040)
+            int mag = abs(gx) + abs(gy);
+            dst[y * width + x] = (mag > edge_thresh) ? 255 : 0;
         }
     }
-
-    heap_caps_free(temp);
 }
 
-// ============== STEP 1.6: DILATION (Restore object size) ==============
-// Dilation expands white regions - use after erosion to restore object size
+// ============== STEP 1.5: DILATION (Close edge gaps) ==============
+// Dilation expands edge pixels - closes small gaps so contour tracer can follow
 
 static void apply_dilation(uint8_t *img, int width, int height, int iterations)
 {
@@ -392,14 +391,12 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
         goto cleanup;
     }
 
-    // Step 1: Threshold
-    ESP_LOGI(TAG, "Step 1: Applying threshold (%d)...", THRESHOLD_VALUE);
-    apply_threshold(grayscale, binary, width, height, THRESHOLD_VALUE);
+    // Step 1: Sobel edge detection
+    ESP_LOGI(TAG, "Step 1: Sobel edge detection (threshold=%d)...", SOBEL_THRESHOLD);
+    apply_sobel(grayscale, binary, width, height, SOBEL_THRESHOLD);
 
-    // Step 1.5: Morphological opening (erosion + dilation) to remove shadows
-    ESP_LOGI(TAG, "Step 1.5: Removing shadows (erosion=%d, dilation=%d)...",
-             EROSION_ITERATIONS, DILATION_ITERATIONS);
-    apply_erosion(binary, width, height, EROSION_ITERATIONS);
+    // Step 1.5: Dilation to close edge gaps
+    ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
     apply_dilation(binary, width, height, DILATION_ITERATIONS);
 
     // Step 2: Trace contour

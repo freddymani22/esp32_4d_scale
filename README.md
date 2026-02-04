@@ -6,8 +6,8 @@ Object measurement system using an **AI-Thinker ESP32-CAM** module. It captures 
 
 The processing pipeline runs entirely on the ESP32:
 
-1. **Threshold** — converts the grayscale frame to binary (object vs background)
-2. **Morphological opening** — erosion followed by dilation to remove shadows
+1. **Sobel edge detection** — computes gradient magnitude to find sharp object edges (ignores soft shadow edges)
+2. **Dilation** — closes small gaps in the detected edges so the contour is connected
 3. **Contour tracing** — Moore boundary tracing to extract the object outline
 4. **Convex hull** — Graham scan algorithm to simplify the contour
 5. **Minimum area rectangle** — rotating calipers to find the tightest bounding box
@@ -26,9 +26,8 @@ All tunable parameters are at the top of `main/main.c`:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `THRESHOLD_VALUE` | 180 | Pixel darkness cutoff for object detection. Lower = stricter |
-| `EROSION_ITERATIONS` | 2 | Erosion passes to remove shadow noise |
-| `DILATION_ITERATIONS` | 2 | Dilation passes to restore object size after erosion |
+| `SOBEL_THRESHOLD` | 150 | Edge magnitude cutoff (0-2040). Increase to ignore weaker edges like shadows |
+| `DILATION_ITERATIONS` | 2 | Dilation passes to close gaps in detected edges |
 | `MAX_CONTOUR_POINTS` | 5000 | Maximum points stored during contour tracing |
 | `PIXELS_PER_MM` | 1.38 | Calibration factor — measure a known object and adjust |
 | `RESET_PHOTO_NUMBER` | true | If true, photo numbering resets to 1 each run |
