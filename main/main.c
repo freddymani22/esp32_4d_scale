@@ -20,13 +20,13 @@
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-// Chromaticity threshold: how different a pixel's color ratio must be from background
-// Range 0.0-1.0. Lower = more sensitive (detects subtle color differences)
-// Typical values: 0.05-0.15
-#define CHROMA_THRESHOLD    0.08f
+// Sobel threshold on chromaticity distance map (0-2040 range)
+// Higher = only sharp color transitions (more strict)
+// Lower = more sensitive to subtle color edges
+#define SOBEL_THRESHOLD     100
 
-#define DILATION_ITERATIONS 2       // Close gaps in detected object mask
-#define EROSION_ITERATIONS  1       // Remove noise specks
+#define DILATION_ITERATIONS 3       // Close gaps in detected edges (increase if contour has breaks)
+#define EROSION_ITERATIONS  0       // Remove noise specks (0 = disabled for edge-based detection)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define PIXELS_PER_MM       1.38f   // Calibrate with known object!
 #define RESET_PHOTO_NUMBER  false   // Set to true to always start from 1 (overwrites existing)
@@ -94,23 +94,31 @@ static inline uint16_t rgb_to_rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (pixel >> 8) | (pixel << 8);
 }
 
-// ============== STEP 1: COLOR-BASED OBJECT DETECTION ==============
-// Uses chromaticity (color ratios) which is invariant to shadows.
-// Shadows scale R, G, B proportionally, so r/(r+g+b) stays constant.
-// Objects have different chromaticity than background.
+// ============== STEP 1: COLOR-BASED OBJECT DETECTION WITH SOBEL ==============
+// Hybrid approach:
+// 1. Compute chromaticity distance from background for each pixel
+// 2. Apply Sobel edge detection on the chromaticity distance map
+// 3. This finds edges where color changes rapidly (object boundaries)
+// 4. Shadows have constant chromaticity so they don't create edges
 
-static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width, int height, float chroma_thresh)
+static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width, int height, int sobel_thresh)
 {
+    // Allocate chromaticity distance map
+    uint8_t *chroma_dist = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
+    if (!chroma_dist) {
+        ESP_LOGE(TAG, "Failed to allocate chroma_dist buffer!");
+        return;
+    }
+
     // Sample background chromaticity from corners
-    float bg_cr = 0, bg_cg = 0;  // background chromaticity (r and g channels, b is implicit)
+    float bg_cr = 0, bg_cg = 0;
     int sample_count = 0;
 
-    // Sample from all 4 corners
     int corners[4][2] = {
-        {0, 0},                           // top-left
-        {width - CORNER_SAMPLE_SIZE, 0},  // top-right
-        {0, height - CORNER_SAMPLE_SIZE}, // bottom-left
-        {width - CORNER_SAMPLE_SIZE, height - CORNER_SAMPLE_SIZE}  // bottom-right
+        {0, 0},
+        {width - CORNER_SAMPLE_SIZE, 0},
+        {0, height - CORNER_SAMPLE_SIZE},
+        {width - CORNER_SAMPLE_SIZE, height - CORNER_SAMPLE_SIZE}
     };
 
     for (int c = 0; c < 4; c++) {
@@ -121,7 +129,7 @@ static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width,
                 uint8_t r, g, b;
                 rgb565_to_rgb(rgb565[y * width + x], &r, &g, &b);
                 int sum = r + g + b;
-                if (sum > 30) {  // Skip very dark pixels
+                if (sum > 30) {
                     bg_cr += (float)r / sum;
                     bg_cg += (float)g / sum;
                     sample_count++;
@@ -134,7 +142,6 @@ static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width,
         bg_cr /= sample_count;
         bg_cg /= sample_count;
     } else {
-        // Fallback to neutral gray
         bg_cr = 0.33f;
         bg_cg = 0.33f;
     }
@@ -142,8 +149,7 @@ static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width,
     ESP_LOGI(TAG, "Background chromaticity: r=%.3f, g=%.3f (from %d samples)",
              bg_cr, bg_cg, sample_count);
 
-    // Classify each pixel
-    int object_pixels = 0;
+    // Step 1: Compute chromaticity distance map (0-255 scale)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int idx = y * width + x;
@@ -152,28 +158,63 @@ static void detect_object_by_color(uint16_t *rgb565, uint8_t *binary, int width,
 
             int sum = r + g + b;
             if (sum < 30) {
-                // Very dark pixel - likely object (or shadow, but we err on side of detection)
-                binary[idx] = 255;
-                object_pixels++;
+                // Very dark pixel - mark as high chromaticity distance
+                chroma_dist[idx] = 255;
             } else {
                 float cr = (float)r / sum;
                 float cg = (float)g / sum;
-
-                // Euclidean distance in chromaticity space
                 float dist = sqrtf((cr - bg_cr) * (cr - bg_cr) + (cg - bg_cg) * (cg - bg_cg));
-
-                if (dist > chroma_thresh) {
-                    binary[idx] = 255;  // Object
-                    object_pixels++;
-                } else {
-                    binary[idx] = 0;    // Background or shadow
-                }
+                // Scale to 0-255 (max possible dist is ~0.82 for extreme colors)
+                int scaled = (int)(dist * 310.0f);
+                chroma_dist[idx] = (scaled > 255) ? 255 : (uint8_t)scaled;
             }
         }
     }
 
-    ESP_LOGI(TAG, "Detected %d object pixels (%.1f%% of image)",
-             object_pixels, 100.0f * object_pixels / (width * height));
+    // Step 2: Apply Sobel on chromaticity distance map
+    // This finds edges where chromaticity changes rapidly (object boundaries)
+    ESP_LOGI(TAG, "Applying Sobel on chromaticity distance map...");
+
+    // Clear borders
+    for (int x = 0; x < width; x++) {
+        binary[x] = 0;
+        binary[(height - 1) * width + x] = 0;
+    }
+    for (int y = 0; y < height; y++) {
+        binary[y * width] = 0;
+        binary[y * width + width - 1] = 0;
+    }
+
+    int edge_pixels = 0;
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            int p00 = chroma_dist[(y - 1) * width + (x - 1)];
+            int p01 = chroma_dist[(y - 1) * width +  x];
+            int p02 = chroma_dist[(y - 1) * width + (x + 1)];
+            int p10 = chroma_dist[ y      * width + (x - 1)];
+            int p12 = chroma_dist[ y      * width + (x + 1)];
+            int p20 = chroma_dist[(y + 1) * width + (x - 1)];
+            int p21 = chroma_dist[(y + 1) * width +  x];
+            int p22 = chroma_dist[(y + 1) * width + (x + 1)];
+
+            int gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
+            int gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
+
+            int mag = abs(gx) + abs(gy);
+
+            if (mag > sobel_thresh) {
+                binary[y * width + x] = 255;
+                edge_pixels++;
+            } else {
+                binary[y * width + x] = 0;
+            }
+        }
+    }
+
+    heap_caps_free(chroma_dist);
+
+    ESP_LOGI(TAG, "Detected %d edge pixels (%.1f%% of image)",
+             edge_pixels, 100.0f * edge_pixels / (width * height));
 }
 
 // ============== STEP 1.5: MORPHOLOGICAL OPERATIONS ==============
@@ -479,9 +520,9 @@ static min_area_rect_t process_image(uint16_t *rgb565, int width, int height)
         goto cleanup;
     }
 
-    // Step 1: Color-based object detection (shadow-invariant)
-    ESP_LOGI(TAG, "Step 1: Color-based detection (chroma_thresh=%.3f)...", CHROMA_THRESHOLD);
-    detect_object_by_color(rgb565, binary, width, height, CHROMA_THRESHOLD);
+    // Step 1: Sobel on chromaticity distance (shadow-invariant edge detection)
+    ESP_LOGI(TAG, "Step 1: Sobel on chromaticity (sobel_thresh=%d)...", SOBEL_THRESHOLD);
+    detect_object_by_color(rgb565, binary, width, height, SOBEL_THRESHOLD);
 
     // Step 1.5: Morphological cleanup (erosion removes noise, dilation fills gaps)
     ESP_LOGI(TAG, "Step 1.5: Morphological cleanup (erosion=%d, dilation=%d)...",
