@@ -29,7 +29,7 @@ All tunable parameters are at the top of `main/main.c`:
 | `SOBEL_THRESHOLD` | 150 | Edge magnitude cutoff (0-2040). Increase to ignore weaker edges like shadows |
 | `DILATION_ITERATIONS` | 2 | Dilation passes to close gaps in detected edges |
 | `MAX_CONTOUR_POINTS` | 5000 | Maximum points stored during contour tracing |
-| `PIXELS_PER_MM` | 1.38 | Calibration factor — measure a known object and adjust |
+| `PIXELS_PER_MM` | 0.99 | Calibration factor for 35 cm camera distance |
 | `RESET_PHOTO_NUMBER` | true | If true, photo numbering resets to 1 each run |
 
 ### Calibration

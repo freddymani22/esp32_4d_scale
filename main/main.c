@@ -23,8 +23,8 @@ static const char *TAG = "measure";
 #define SOBEL_THRESHOLD     150     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
 #define DILATION_ITERATIONS 2       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
-#define PIXELS_PER_MM       1.38f   // Calibrate with known object!
-#define RESET_PHOTO_NUMBER  true    // Set to true to always start from 1 (overwrites existing)
+#define PIXELS_PER_MM       0.99f   // Calibrated for 35 cm (13.8") camera distance
+#define RESET_PHOTO_NUMBER  false    // Set to true to always start from 1 (overwrites existing)
 // ===========================================
 
 // AI-Thinker ESP32-CAM Pin Mapping
