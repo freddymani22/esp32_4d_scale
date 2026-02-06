@@ -14,8 +14,14 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "driver/gpio.h"
+#include "rom/ets_sys.h"
 
 #define PHOTO_FOLDER "/sdcard/photos"
+
+// ============== HX711 CONFIGURATION ==============
+#define HX711_DOUT_PIN  14
+#define HX711_SCK_PIN   15
 
 static const char *TAG = "measure";
 
@@ -62,6 +68,106 @@ typedef struct {
     float height_mm;
     bool valid;
 } min_area_rect_t;
+
+// ============== HX711 LOAD CELL ==============
+
+static void hx711_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << HX711_SCK_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    io_conf.pin_bit_mask = (1ULL << HX711_DOUT_PIN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    gpio_config(&io_conf);
+
+    gpio_set_level(HX711_SCK_PIN, 0);
+    ESP_LOGI(TAG, "HX711 initialized (DOUT=%d, SCK=%d)", HX711_DOUT_PIN, HX711_SCK_PIN);
+}
+
+static bool hx711_is_ready(void)
+{
+    return gpio_get_level(HX711_DOUT_PIN) == 0;
+}
+
+static int32_t hx711_read_raw(void)
+{
+    // Wait for HX711 to be ready (DOUT goes LOW)
+    int timeout = 1000;
+    while (!hx711_is_ready() && timeout > 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        timeout--;
+    }
+
+    if (timeout == 0) {
+        ESP_LOGW(TAG, "HX711 timeout - not ready");
+        return 0;
+    }
+
+    // Read 24 bits
+    int32_t data = 0;
+    for (int i = 0; i < 24; i++) {
+        gpio_set_level(HX711_SCK_PIN, 1);
+        ets_delay_us(1);
+        data = (data << 1) | gpio_get_level(HX711_DOUT_PIN);
+        gpio_set_level(HX711_SCK_PIN, 0);
+        ets_delay_us(1);
+    }
+
+    // 25th pulse: set gain to 128 for channel A (default)
+    gpio_set_level(HX711_SCK_PIN, 1);
+    ets_delay_us(1);
+    gpio_set_level(HX711_SCK_PIN, 0);
+    ets_delay_us(1);
+
+    // Convert from 24-bit two's complement
+    if (data & 0x800000) {
+        data |= 0xFF000000;  // Sign extend
+    }
+
+    return data;
+}
+
+static void hx711_test(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║       HX711 Load Cell Test            ║");
+    ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
+
+    // Phase 1: Baseline (no load)
+    ESP_LOGI(TAG, ">>> Do NOT press load cell — reading baseline...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    int32_t baseline = 0;
+    for (int i = 0; i < 5; i++) {
+        int32_t raw = hx711_read_raw();
+        baseline += raw;
+        ESP_LOGI(TAG, "  Baseline[%d]: %ld", i + 1, (long)raw);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    baseline /= 5;
+    ESP_LOGI(TAG, "  Average baseline: %ld", (long)baseline);
+
+    // Phase 2: With load
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, ">>> NOW PRESS the load cell! You have 3 seconds...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    ESP_LOGI(TAG, ">>> Reading with load...");
+    for (int i = 0; i < 5; i++) {
+        int32_t raw = hx711_read_raw();
+        int32_t diff = raw - baseline;
+        ESP_LOGI(TAG, "  Loaded[%d]: %ld  (diff: %ld)", i + 1, (long)raw, (long)diff);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "If 'diff' values are large when pressing, load cell is working!");
+}
 
 // ============== STEP 1: SOBEL EDGE DETECTION ==============
 
@@ -576,6 +682,10 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Waiting for camera to stabilize...");
     vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Initialize and test HX711
+    hx711_init();
+    hx711_test();
 
     int photo_num = get_next_photo_number();
 
