@@ -3,21 +3,35 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
-#include <sys/stat.h>
-#include <sys/unistd.h>
 #include "esp_log.h"
 #include "esp_camera.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "driver/sdmmc_host.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 #include "driver/gpio.h"
 #include "rom/ets_sys.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_http_client.h"
+#include "soc/rtc_cntl_reg.h"
 
-#define PHOTO_FOLDER "/sdcard/photos"
+// ============== WIFI CONFIGURATION ==============
+#define WIFI_SSID       "VithamasTech_Gnd Flr Hall_1"
+#define WIFI_PASS       "#Newbusiness$"
+#define SERVER_IP       "192.168.0.243"
+#define SERVER_PORT     8080
+#define WIFI_MAX_RETRY  10
+#define HX711_CAL_FACTOR_DEFAULT 29.46f   // raw units per gram (fallback)
+static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
+
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static int s_retry_num = 0;
 
 // ============== HX711 CONFIGURATION ==============
 #define HX711_DOUT_PIN  14
@@ -30,7 +44,6 @@ static const char *TAG = "measure";
 #define DILATION_ITERATIONS 2       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define PIXELS_PER_MM       0.99f   // Calibrated for 35 cm (13.8") camera distance
-#define RESET_PHOTO_NUMBER  false    // Set to true to always start from 1 (overwrites existing)
 // ===========================================
 
 // AI-Thinker ESP32-CAM Pin Mapping
@@ -70,25 +83,6 @@ typedef struct {
 } min_area_rect_t;
 
 // ============== HX711 LOAD CELL ==============
-
-static void hx711_init(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << HX711_SCK_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-
-    io_conf.pin_bit_mask = (1ULL << HX711_DOUT_PIN);
-    io_conf.mode = GPIO_MODE_INPUT;
-    gpio_config(&io_conf);
-
-    gpio_set_level(HX711_SCK_PIN, 0);
-    ESP_LOGI(TAG, "HX711 initialized (DOUT=%d, SCK=%d)", HX711_DOUT_PIN, HX711_SCK_PIN);
-}
 
 static bool hx711_is_ready(void)
 {
@@ -133,40 +127,267 @@ static int32_t hx711_read_raw(void)
     return data;
 }
 
-static void hx711_test(void)
+static void hx711_init(void)
 {
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║       HX711 Load Cell Test            ║");
-    ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << HX711_SCK_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
 
-    // Phase 1: Baseline (no load)
-    ESP_LOGI(TAG, ">>> Do NOT press load cell — reading baseline...");
+    io_conf.pin_bit_mask = (1ULL << HX711_DOUT_PIN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    gpio_config(&io_conf);
+
+    gpio_set_level(HX711_SCK_PIN, 0);
+    ESP_LOGI(TAG, "HX711 initialized (DOUT=%d, SCK=%d)", HX711_DOUT_PIN, HX711_SCK_PIN);
+
+    // Wait for HX711 to stabilize and discard first readings
     vTaskDelay(pdMS_TO_TICKS(2000));
-    int32_t baseline = 0;
+    for (int i = 0; i < 5; i++) {
+        hx711_read_raw();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    ESP_LOGI(TAG, "HX711 warm-up done");
+}
+
+static int32_t hx711_tare = 0;
+
+static void hx711_read_tare(void)
+{
+    ESP_LOGI(TAG, ">>> Reading tare (empty plywood)...");
+    int32_t total = 0;
+    int valid = 0;
+    for (int i = 0; i < 10; i++) {
+        int32_t raw = hx711_read_raw();
+        ESP_LOGI(TAG, "  Tare[%d]: %ld", i + 1, (long)raw);
+        if (raw != 0) {
+            total += raw;
+            valid++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    hx711_tare = (valid > 0) ? total / valid : 0;
+    ESP_LOGI(TAG, "  Tare average: %ld (%d valid readings)", (long)hx711_tare, valid);
+}
+
+static int32_t hx711_raw_avg = 0;  // stored for upload to server
+
+static float hx711_read_grams(void)
+{
+    int32_t total = 0;
     for (int i = 0; i < 5; i++) {
         int32_t raw = hx711_read_raw();
-        baseline += raw;
-        ESP_LOGI(TAG, "  Baseline[%d]: %ld", i + 1, (long)raw);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        total += raw;
+        ESP_LOGI(TAG, "  Weight read[%d]: %ld", i + 1, (long)raw);
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
-    baseline /= 5;
-    ESP_LOGI(TAG, "  Average baseline: %ld", (long)baseline);
+    int32_t avg = total / 5;
+    hx711_raw_avg = avg;
+    int32_t diff = avg - hx711_tare;
+    float grams = fabsf((float)diff) / hx711_cal_factor;
+    if (grams < 2.0f) grams = 0;  // noise floor
+    ESP_LOGI(TAG, "Weight: %.1f g (raw avg: %ld, tare: %ld, diff: %ld, cal: %.4f)",
+             grams, (long)avg, (long)hx711_tare, (long)diff, hx711_cal_factor);
+    return grams;
+}
 
-    // Phase 2: With load
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> NOW PRESS the load cell! You have 3 seconds...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    ESP_LOGI(TAG, ">>> Reading with load...");
-    for (int i = 0; i < 5; i++) {
-        int32_t raw = hx711_read_raw();
-        int32_t diff = raw - baseline;
-        ESP_LOGI(TAG, "  Loaded[%d]: %ld  (diff: %ld)", i + 1, (long)raw, (long)diff);
-        vTaskDelay(pdMS_TO_TICKS(500));
+// ============== WIFI ==============
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < WIFI_MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "Retrying WiFi connection (%d/%d)...", s_retry_num, WIFI_MAX_RETRY);
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            ESP_LOGE(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static bool wifi_init(void)
+{
+    ESP_LOGI(TAG, "Initializing WiFi...");
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: 0x%x", ret);
+        return false;
     }
 
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "If 'diff' values are large when pressing, load cell is working!");
+    s_wifi_event_group = xEventGroupCreate();
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                        &wifi_event_handler, NULL, &instance_any_id);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                        &wifi_event_handler, NULL, &instance_got_ip);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "Connecting to '%s'...", WIFI_SSID);
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected!");
+        return true;
+    }
+    ESP_LOGE(TAG, "WiFi connection failed!");
+    return false;
+}
+
+// ============== FETCH CALIBRATION FROM SERVER ==============
+
+// HTTP event handler: accumulates response body into a buffer
+typedef struct {
+    char *buf;
+    int len;
+    int capacity;
+} http_response_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    http_response_t *resp = (http_response_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && resp) {
+        int new_len = resp->len + evt->data_len;
+        if (new_len < resp->capacity) {
+            memcpy(resp->buf + resp->len, evt->data, evt->data_len);
+            resp->len = new_len;
+            resp->buf[resp->len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static void fetch_cal_factor(void)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/config", SERVER_IP, SERVER_PORT);
+
+    char body[128] = {0};
+    http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+        .event_handler = http_event_handler,
+        .user_data = &resp,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+        // Simple JSON parse: find "cal_factor": <number>
+        const char *key = "\"cal_factor\"";
+        char *pos = strstr(body, key);
+        if (pos) {
+            pos += strlen(key);
+            // Skip colon and whitespace
+            while (*pos == ':' || *pos == ' ' || *pos == '\t') pos++;
+            float val = strtof(pos, NULL);
+            if (val > 0.0f) {
+                hx711_cal_factor = val;
+                ESP_LOGI(TAG, "Fetched cal_factor from server: %.4f", hx711_cal_factor);
+            } else {
+                ESP_LOGW(TAG, "Invalid cal_factor in response, using default");
+            }
+        } else {
+            ESP_LOGW(TAG, "cal_factor not found in response: %s", body);
+        }
+    } else {
+        ESP_LOGW(TAG, "Failed to fetch config (err=%s, status=%d), using default cal_factor=%.4f",
+                 esp_err_to_name(err),
+                 err == ESP_OK ? esp_http_client_get_status_code(client) : -1,
+                 hx711_cal_factor);
+    }
+
+    esp_http_client_cleanup(client);
+}
+
+// ============== HTTP UPLOAD ==============
+
+static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
+                          min_area_rect_t *rect, float weight_g)
+{
+    char url[320];
+    snprintf(url, sizeof(url),
+             "http://%s:%d/upload?valid=%d&width_mm=%.1f&height_mm=%.1f"
+             "&width_px=%.1f&height_px=%.1f&angle=%.1f&weight_g=%.1f"
+             "&raw_tare=%ld&raw_avg=%ld",
+             SERVER_IP, SERVER_PORT,
+             rect->valid ? 1 : 0,
+             rect->valid ? rect->width_mm : 0.0f,
+             rect->valid ? rect->height_mm : 0.0f,
+             rect->valid ? rect->width : 0.0f,
+             rect->valid ? rect->height : 0.0f,
+             rect->valid ? rect->angle : 0.0f,
+             weight_g,
+             (long)hx711_tare, (long)hx711_raw_avg);
+
+    ESP_LOGI(TAG, "Uploading to %s:%d (%zu bytes)...", SERVER_IP, SERVER_PORT, pgm_size);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    esp_http_client_set_post_field(client, (const char *)pgm_data, pgm_size);
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool success = false;
+
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Upload complete! HTTP %d", status);
+        success = (status == 200);
+    } else {
+        ESP_LOGE(TAG, "Upload failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return success;
 }
 
 // ============== STEP 1: SOBEL EDGE DETECTION ==============
@@ -551,32 +772,6 @@ static void print_memory_info(void)
     ESP_LOGI(TAG, "Internal RAM Free: %zu bytes", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
-static esp_err_t init_sd_card(void)
-{
-    ESP_LOGI(TAG, "Initializing SD card...");
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.flags = SDMMC_HOST_FLAG_1BIT;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
-
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 1;
-
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 20,
-        .allocation_unit_size = 16 * 1024
-    };
-
-    sdmmc_card_t *card;
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SD card mount failed! Error: 0x%x", ret);
-        return ret;
-    }
-    ESP_LOGI(TAG, "SD card mounted!");
-    return ESP_OK;
-}
-
 static esp_err_t init_camera(void)
 {
     ESP_LOGI(TAG, "Initializing camera...");
@@ -617,50 +812,13 @@ static esp_err_t init_camera(void)
     return ESP_OK;
 }
 
-static void create_photo_folder(void)
-{
-    struct stat st;
-    if (stat(PHOTO_FOLDER, &st) != 0) {
-        mkdir(PHOTO_FOLDER, 0775);
-    }
-}
-
-static int get_next_photo_number(void)
-{
-#if RESET_PHOTO_NUMBER
-    return 1;  // Always start from 1 (overwrites existing files)
-#else
-    char filename[64];
-    struct stat st;
-    int num = 1;
-    while (num < 10000) {
-        snprintf(filename, sizeof(filename), PHOTO_FOLDER "/img%d.pgm", num);
-        if (stat(filename, &st) != 0) break;
-        num++;
-    }
-    return num;
-#endif
-}
-
-static void save_pgm(uint8_t *data, int width, int height, const char *filename)
-{
-    FILE *f = fopen(filename, "wb");
-    if (f) {
-        fprintf(f, "P5\n%d %d\n255\n", width, height);
-        fwrite(data, 1, width * height, f);
-        fflush(f);
-        fsync(fileno(f));
-        fclose(f);
-        ESP_LOGI(TAG, "Saved: %s", filename);
-    } else {
-        ESP_LOGE(TAG, "Failed to save: %s (errno=%d: %s)", filename, errno, strerror(errno));
-    }
-}
-
 // ============== MAIN ==============
 
 void app_main(void)
 {
+    // Disable brownout detector (WiFi current spikes cause false triggers)
+    CLEAR_PERI_REG_MASK(RTC_CNTL_BROWN_OUT_REG, RTC_CNTL_BROWN_OUT_ENA);
+
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
     ESP_LOGI(TAG, "║   ESP32-CAM Object Measurement        ║");
@@ -669,28 +827,45 @@ void app_main(void)
 
     print_memory_info();
 
-    if (init_sd_card() != ESP_OK) {
-        ESP_LOGE(TAG, "SD card required!");
-        return;
-    }
-    create_photo_folder();
-
     if (init_camera() != ESP_OK) {
         ESP_LOGE(TAG, "Camera required!");
         return;
     }
 
-    ESP_LOGI(TAG, "Waiting for camera to stabilize...");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    // Step 0: Connect WiFi and fetch calibration factor from server
+    bool wifi_ok = wifi_init();
+    if (wifi_ok) {
+        fetch_cal_factor();
+    }
 
-    // Initialize and test HX711
+    // Stop WiFi during HX711 readings — RF noise interferes with the 24-bit ADC
+    ESP_LOGI(TAG, "Stopping WiFi for clean HX711 readings...");
+    esp_wifi_stop();
+
+    // Step 1: Read tare on empty plywood
     hx711_init();
-    hx711_test();
+    hx711_read_tare();
 
-    int photo_num = get_next_photo_number();
-
-    // Capture and process
+    // Step 2: Place object on load cell and weigh
     ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, ">>> Place object on the scale... (5 seconds)");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, ">>> Settling... (3 seconds)");
+    // Discard a few readings while load cell settles
+    for (int i = 0; i < 5; i++) {
+        hx711_read_raw();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    ESP_LOGI(TAG, ">>> Reading weight...");
+    float weight_g = hx711_read_grams();
+    ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
+
+    // Step 3: Place object under camera
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, ">>> Now place object under camera... (5 seconds)");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Step 4: Capture image
     ESP_LOGI(TAG, ">>> Capturing image...");
 
     camera_fb_t *fb = esp_camera_fb_get();
@@ -716,22 +891,10 @@ void app_main(void)
     // Return camera buffer immediately
     esp_camera_fb_return(fb);
 
-    // Save original (shorter names for FAT compatibility)
-    char filename[64];
-    snprintf(filename, sizeof(filename), PHOTO_FOLDER "/img%d.pgm", photo_num);
-    save_pgm(img_copy, img_width, img_height, filename);
-
     // Process: find min area rectangle (this modifies img_copy)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Processing image...");
     min_area_rect_t rect = process_image(img_copy, img_width, img_height);
-
-    // Save processed (with rectangle drawn)
-    snprintf(filename, sizeof(filename), PHOTO_FOLDER "/res%d.pgm", photo_num);
-    save_pgm(img_copy, img_width, img_height, filename);
-
-    // Free our copy
-    heap_caps_free(img_copy);
 
     // Print results
     ESP_LOGI(TAG, "");
@@ -750,22 +913,46 @@ void app_main(void)
         ESP_LOGI(TAG, "║    Width:  %.1f mm                    ", rect.width_mm);
         ESP_LOGI(TAG, "║    Height: %.1f mm                    ", rect.height_mm);
         ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Corners:                             ║");
-        for (int i = 0; i < 4; i++) {
-            ESP_LOGI(TAG, "║    [%d]: (%.1f, %.1f)               ", i, rect.corners[i].x, rect.corners[i].y);
-        }
+        ESP_LOGI(TAG, "║  Weight:                              ║");
+        ESP_LOGI(TAG, "║    %.1f g  (%.3f kg)                  ", weight_g, weight_g / 1000.0f);
         ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
     } else {
         ESP_LOGW(TAG, "No object detected!");
     }
 
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Files saved:");
-    ESP_LOGI(TAG, "  - img%d.pgm  (original)", photo_num);
-    ESP_LOGI(TAG, "  - res%d.pgm  (with rectangle)", photo_num);
+    // Restart WiFi for upload
+    if (wifi_ok) {
+        ESP_LOGI(TAG, "Restarting WiFi for upload...");
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        s_retry_num = 0;
+        esp_wifi_start();
+        // Wait for reconnection
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                            pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+    }
 
-    // Unmount SD card safely
-    esp_vfs_fat_sdcard_unmount("/sdcard", NULL);
+    // Upload result image via WiFi
+    if (wifi_ok) {
+        // Build PGM in memory (header + raw pixels)
+        char pgm_header[32];
+        int hdr_len = snprintf(pgm_header, sizeof(pgm_header), "P5\n%d %d\n255\n", img_width, img_height);
+        size_t pgm_size = hdr_len + img_size;
+        uint8_t *pgm_buf = heap_caps_malloc(pgm_size, MALLOC_CAP_SPIRAM);
+
+        if (pgm_buf) {
+            memcpy(pgm_buf, pgm_header, hdr_len);
+            memcpy(pgm_buf + hdr_len, img_copy, img_size);
+
+            upload_result(pgm_buf, pgm_size, &rect, weight_g);
+            heap_caps_free(pgm_buf);
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate upload buffer!");
+        }
+    }
+
+    // Free image copy
+    heap_caps_free(img_copy);
+
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> SD CARD SAFE TO REMOVE! <<<");
+    ESP_LOGI(TAG, "Done!");
 }

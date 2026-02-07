@@ -20,5 +20,6 @@
   ],
   "idf.portWin": "COM3",
   "idf.port": "/dev/ttyUSB0",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "/home/freddy/esp/v5.5.2/esp-idf"
 }
