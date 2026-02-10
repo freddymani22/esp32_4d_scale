@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_http_client.h"
 #include "soc/rtc_cntl_reg.h"
+#include "esp_timer.h"
 
 // ============== WIFI CONFIGURATION ==============
 #define WIFI_SSID       "VithamasTech_Gnd Flr Hall_1"
@@ -32,6 +33,12 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 static int s_retry_num = 0;
+
+// ============== ULTRASONIC SENSOR (HC-SR04) ==============
+#define US_TRIG_PIN     13
+#define US_ECHO_PIN     12
+#define ROOM_TEMP_C     30.0f   // Room temperature in °C (affects speed of sound)
+#define US_CAL_FACTOR   1.0f    // Distance correction: actual_cm / measured_cm
 
 // ============== HX711 CONFIGURATION ==============
 #define HX711_DOUT_PIN  14
@@ -175,17 +182,18 @@ static void hx711_read_tare(void)
 }
 
 static int32_t hx711_raw_avg = 0;  // stored for upload to server
+static float g_distance_cm = -1.0f;  // stored for upload to server
 
 static float hx711_read_grams(void)
 {
     int32_t total = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 10; i++) {
         int32_t raw = hx711_read_raw();
         total += raw;
         ESP_LOGI(TAG, "  Weight read[%d]: %ld", i + 1, (long)raw);
         vTaskDelay(pdMS_TO_TICKS(300));
     }
-    int32_t avg = total / 5;
+    int32_t avg = total / 10;
     hx711_raw_avg = avg;
     int32_t diff = avg - hx711_tare;
     float grams = fabsf((float)diff) / hx711_cal_factor;
@@ -193,6 +201,126 @@ static float hx711_read_grams(void)
     ESP_LOGI(TAG, "Weight: %.1f g (raw avg: %ld, tare: %ld, diff: %ld, cal: %.4f)",
              grams, (long)avg, (long)hx711_tare, (long)diff, hx711_cal_factor);
     return grams;
+}
+
+// ============== ULTRASONIC SENSOR ==============
+
+static void ultrasonic_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << US_TRIG_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    io_conf.pin_bit_mask = (1ULL << US_ECHO_PIN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;  // Pull ECHO LOW when idle
+    gpio_config(&io_conf);
+
+    gpio_set_level(US_TRIG_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));  // Let sensor settle
+
+    // Diagnostic: check ECHO state before any trigger
+    int echo_state = gpio_get_level(US_ECHO_PIN);
+    ESP_LOGI(TAG, "Ultrasonic sensor initialized (TRIG=GPIO%d, ECHO=GPIO%d)", US_TRIG_PIN, US_ECHO_PIN);
+    ESP_LOGI(TAG, "  ECHO pin idle state: %s", echo_state ? "HIGH (PROBLEM!)" : "LOW (OK)");
+    if (echo_state) {
+        ESP_LOGW(TAG, "  ECHO reads HIGH with no trigger — check wiring/voltage divider!");
+    }
+}
+
+static float ultrasonic_read_cm(void)
+{
+    // Wait for ECHO to be LOW before triggering (clear any leftover echo)
+    int64_t wait_low = esp_timer_get_time() + 50000;  // 50ms max wait
+    while (gpio_get_level(US_ECHO_PIN) == 1) {
+        if (esp_timer_get_time() > wait_low) {
+            ESP_LOGW(TAG, "  ECHO stuck HIGH before trigger — skipping");
+            return -1.0f;
+        }
+    }
+
+    // Send 10us trigger pulse
+    ESP_LOGI(TAG, "  Sending trigger pulse...");
+    gpio_set_level(US_TRIG_PIN, 0);
+    ets_delay_us(5);
+    gpio_set_level(US_TRIG_PIN, 1);
+    ets_delay_us(10);
+    gpio_set_level(US_TRIG_PIN, 0);
+
+    // Wait for ECHO to go HIGH (timeout ~30ms)
+    ESP_LOGI(TAG, "  Waiting for ECHO to go HIGH...");
+    int64_t timeout = esp_timer_get_time() + 30000;
+    while (gpio_get_level(US_ECHO_PIN) == 0) {
+        if (esp_timer_get_time() > timeout) {
+            ESP_LOGW(TAG, "  ECHO never went HIGH — no response from sensor");
+            return -1.0f;
+        }
+    }
+
+    // Measure how long ECHO stays HIGH
+    ESP_LOGI(TAG, "  ECHO is HIGH, measuring duration...");
+    int64_t start = esp_timer_get_time();
+    timeout = start + 30000;
+    while (gpio_get_level(US_ECHO_PIN) == 1) {
+        if (esp_timer_get_time() > timeout) {
+            ESP_LOGW(TAG, "  ECHO stayed HIGH too long — object too far or no object");
+            return -1.0f;
+        }
+    }
+    int64_t duration_us = esp_timer_get_time() - start;
+
+    // Distance = (duration * speed_of_sound) / 2
+    // Speed of sound = 331.3 + (0.606 * temp_C) m/s => cm/us
+    float speed_cm_per_us = (331.3f + 0.606f * ROOM_TEMP_C) / 10000.0f;
+    float distance_cm = (float)duration_us * speed_cm_per_us / 2.0f * US_CAL_FACTOR;
+    ESP_LOGI(TAG, "  Echo duration: %lld us -> %.2f cm", (long long)duration_us, distance_cm);
+    return distance_cm;
+}
+
+// Average multiple readings, discard outliers
+static float ultrasonic_measure(void)
+{
+    ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   Ultrasonic Distance Measurement     ║");
+    ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
+    ESP_LOGI(TAG, "Taking 5 readings (TRIG=GPIO%d, ECHO=GPIO%d)...", US_TRIG_PIN, US_ECHO_PIN);
+
+    float readings[5];
+    int valid = 0;
+
+    for (int i = 0; i < 5; i++) {
+        ESP_LOGI(TAG, "--- Reading %d/5 ---", i + 1);
+        float d = ultrasonic_read_cm();
+        if (d > 0.0f && d < 400.0f) {
+            ESP_LOGI(TAG, "  Result: %.2f cm [VALID]", d);
+            readings[valid++] = d;
+        } else {
+            ESP_LOGW(TAG, "  Result: %.2f cm [INVALID - discarded]", d);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // HC-SR04 needs time between readings
+    }
+
+    ESP_LOGI(TAG, "--- Summary: %d/5 valid readings ---", valid);
+
+    if (valid == 0) {
+        ESP_LOGW(TAG, "No valid readings! Check sensor wiring.");
+        return -1.0f;
+    }
+
+    float sum = 0;
+    for (int i = 0; i < valid; i++) {
+        ESP_LOGI(TAG, "  Valid[%d]: %.2f cm", i + 1, readings[i]);
+        sum += readings[i];
+    }
+    float avg = sum / valid;
+
+    ESP_LOGI(TAG, ">>> Average distance: %.2f cm", avg);
+    return avg;
 }
 
 // ============== WIFI ==============
@@ -352,7 +480,7 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
     snprintf(url, sizeof(url),
              "http://%s:%d/upload?valid=%d&width_mm=%.1f&height_mm=%.1f"
              "&width_px=%.1f&height_px=%.1f&angle=%.1f&weight_g=%.1f"
-             "&raw_tare=%ld&raw_avg=%ld",
+             "&raw_tare=%ld&raw_avg=%ld&distance_cm=%.2f",
              SERVER_IP, SERVER_PORT,
              rect->valid ? 1 : 0,
              rect->valid ? rect->width_mm : 0.0f,
@@ -361,7 +489,7 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
              rect->valid ? rect->height : 0.0f,
              rect->valid ? rect->angle : 0.0f,
              weight_g,
-             (long)hx711_tare, (long)hx711_raw_avg);
+             (long)hx711_tare, (long)hx711_raw_avg, g_distance_cm);
 
     ESP_LOGI(TAG, "Uploading to %s:%d (%zu bytes)...", SERVER_IP, SERVER_PORT, pgm_size);
 
@@ -838,6 +966,16 @@ void app_main(void)
         fetch_cal_factor();
     }
 
+    // Measure distance with ultrasonic sensor (while WiFi is still on, before HX711)
+    ultrasonic_init();
+    ESP_LOGI(TAG, ">>> Measuring distance...");
+    g_distance_cm = ultrasonic_measure();
+    if (g_distance_cm > 0) {
+        ESP_LOGI(TAG, ">>> Distance: %.2f cm", g_distance_cm);
+    } else {
+        ESP_LOGW(TAG, ">>> Distance: N/A (sensor error)");
+    }
+
     // Stop WiFi during HX711 readings — RF noise interferes with the 24-bit ADC
     ESP_LOGI(TAG, "Stopping WiFi for clean HX711 readings...");
     esp_wifi_stop();
@@ -915,6 +1053,13 @@ void app_main(void)
         ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
         ESP_LOGI(TAG, "║  Weight:                              ║");
         ESP_LOGI(TAG, "║    %.1f g  (%.3f kg)                  ", weight_g, weight_g / 1000.0f);
+        ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
+        ESP_LOGI(TAG, "║  Distance:                            ║");
+        if (g_distance_cm > 0) {
+            ESP_LOGI(TAG, "║    %.2f cm                            ", g_distance_cm);
+        } else {
+            ESP_LOGI(TAG, "║    N/A                                ║");
+        }
         ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
     } else {
         ESP_LOGW(TAG, "No object detected!");

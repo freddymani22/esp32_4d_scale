@@ -81,13 +81,14 @@ def upload():
         "weight_g": float(request.args.get("weight_g", 0)),
         "raw_tare": int(request.args.get("raw_tare", 0)),
         "raw_avg": int(request.args.get("raw_avg", 0)),
+        "distance_cm": float(request.args.get("distance_cm", -1)),
     }
 
     measurements = load_measurements()
     measurements.insert(0, entry)
     save_measurements(measurements)
 
-    print(f"  -> {entry['width_mm']:.1f} x {entry['height_mm']:.1f} mm, {entry['weight_g']:.1f} g")
+    print(f"  -> {entry['width_mm']:.1f} x {entry['height_mm']:.1f} mm, {entry['weight_g']:.1f} g, dist={entry['distance_cm']:.2f} cm")
     return {"status": "ok", "filename": img_filename}, 200
 
 
@@ -172,6 +173,7 @@ PAGE_TEMPLATE = """
         .dim-value.h { color: #81c784; }
         .dim-value.wt { color: #ffb74d; }
         .dim-value.a { color: #ce93d8; }
+        .dim-value.d { color: #e57373; }
         .dim-sub { color: #666; font-size: 11px; }
         .no-detect { color: #ef5350; font-style: italic; padding: 10px; text-align: center; }
         .empty { color: #555; text-align: center; padding: 60px; font-size: 16px; }
@@ -246,6 +248,14 @@ PAGE_TEMPLATE = """
                         <div class="dim-label">Angle</div>
                         <div class="dim-value a">{{ "%.1f"|format(m.angle) }}&deg;</div>
                         <div class="dim-sub">rotation</div>
+                    </div>
+                    <div class="dim-box" style="grid-column: span 2;">
+                        <div class="dim-label">Distance</div>
+                        {% if m.get('distance_cm', -1) > 0 %}
+                        <div class="dim-value d">{{ "%.2f"|format(m.distance_cm) }} cm</div>
+                        {% else %}
+                        <div class="dim-value d">N/A</div>
+                        {% endif %}
                     </div>
                 </div>
                 <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}</div>
