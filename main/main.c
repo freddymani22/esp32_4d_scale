@@ -47,10 +47,15 @@ static int s_retry_num = 0;
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define SOBEL_THRESHOLD     150     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
-#define DILATION_ITERATIONS 2       // Close edge gaps after Sobel (increase if contour has breaks)
+#define SOBEL_THRESHOLD     130     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
+#define DILATION_ITERATIONS 3       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
-#define PIXELS_PER_MM       0.99f   // Calibrated for 35 cm (13.8") camera distance
+#define MAX_CONTOUR_SEARCH  10      // Max contours to evaluate before picking the largest
+#define ROI_MARGIN_PERCENT  5       // Ignore outer N% of image on each side (eliminates surface edge noise)
+#define MIN_BBOX_AREA_PCT   2       // Minimum contour bounding box as % of image area (rejects tiny noise)
+#define PIXELS_PER_MM_REF   0.99f   // Calibrated at reference distance
+#define CALIBRATION_DIST_CM 34.5f   // Reference distance (cm) for PIXELS_PER_MM_REF
+#define FIXED_BASELINE_CM      34.5f  // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
 
 // AI-Thinker ESP32-CAM Pin Mapping
@@ -70,6 +75,7 @@ static const char *TAG = "measure";
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
+#define FLASH_GPIO_NUM     4      // On-board flash LED
 
 // ============== DATA STRUCTURES ==============
 
@@ -84,8 +90,8 @@ typedef struct {
     float height;       // pixels
     float angle;        // degrees
     point_t corners[4];
+    float length_mm;
     float width_mm;
-    float height_mm;
     bool valid;
 } min_area_rect_t;
 
@@ -182,7 +188,10 @@ static void hx711_read_tare(void)
 }
 
 static int32_t hx711_raw_avg = 0;  // stored for upload to server
-static float g_distance_cm = -1.0f;  // stored for upload to server
+static float g_baseline_cm = -1.0f;  // distance to empty surface
+static float g_object_cm = -1.0f;    // distance to object top
+static float g_object_height_cm = 0.0f;
+static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
 
 static float hx711_read_grams(void)
 {
@@ -459,21 +468,25 @@ static void fetch_cal_factor(void)
 static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
                           min_area_rect_t *rect, float weight_g)
 {
-    char url[320];
+    char url[512];
     snprintf(url, sizeof(url),
-             "http://%s:%d/upload?valid=%d&width_mm=%.1f&height_mm=%.1f"
-             "&width_px=%.1f&height_px=%.1f&angle=%.1f&weight_g=%.1f"
-             "&raw_tare=%ld&raw_avg=%ld&distance_cm=%.2f",
+             "http://%s:%d/upload?valid=%d&length_mm=%.1f&width_mm=%.1f"
+             "&length_px=%.1f&width_px=%.1f&angle=%.1f&weight_g=%.1f"
+             "&raw_tare=%ld&raw_avg=%ld"
+             "&baseline_cm=%.2f&object_cm=%.2f&height_cm=%.2f&pixels_per_mm=%.4f",
              SERVER_IP, SERVER_PORT,
              rect->valid ? 1 : 0,
+             rect->valid ? rect->length_mm : 0.0f,
              rect->valid ? rect->width_mm : 0.0f,
-             rect->valid ? rect->height_mm : 0.0f,
              rect->valid ? rect->width : 0.0f,
              rect->valid ? rect->height : 0.0f,
              rect->valid ? rect->angle : 0.0f,
              weight_g,
-             (long)hx711_tare, (long)hx711_raw_avg, g_distance_cm);
+             (long)hx711_tare, (long)hx711_raw_avg,
+             g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm);
 
+    ESP_LOGI(TAG, "Upload params: baseline=%.2f cm, object=%.2f cm, object_height=%.2f cm, ppmm=%.4f",
+             g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm);
     ESP_LOGI(TAG, "Uploading to %s:%d (%zu bytes)...", SERVER_IP, SERVER_PORT, pgm_size);
 
     esp_http_client_config_t config = {
@@ -689,7 +702,7 @@ static float dot_product(float ax, float ay, float bx, float by)
     return ax * bx + ay * by;
 }
 
-static min_area_rect_t find_min_area_rect(point_t *hull, int n)
+static min_area_rect_t find_min_area_rect(point_t *hull, int n, float pixels_per_mm)
 {
     min_area_rect_t result = {0};
     result.valid = false;
@@ -775,9 +788,9 @@ static min_area_rect_t find_min_area_rect(point_t *hull, int n)
     while (result.angle > 90.0f) result.angle -= 180.0f;
     while (result.angle < -90.0f) result.angle += 180.0f;
 
-    // Convert to mm
-    result.width_mm = result.width / PIXELS_PER_MM;
-    result.height_mm = result.height / PIXELS_PER_MM;
+    // Convert to mm: width (longer side in px) = length, height (shorter side in px) = width
+    result.length_mm = result.width / pixels_per_mm;
+    result.width_mm = result.height / pixels_per_mm;
 
     return result;
 }
@@ -815,7 +828,7 @@ static void draw_min_area_rect(uint8_t *img, int width, int height, min_area_rec
 
 // ============== MAIN PROCESSING FUNCTION ==============
 
-static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
+static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, float pixels_per_mm)
 {
     min_area_rect_t result = {0};
 
@@ -837,13 +850,87 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
     ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
     apply_dilation(binary, width, height, DILATION_ITERATIONS);
 
-    // Step 2: Trace contour
-    ESP_LOGI(TAG, "Step 2: Tracing contour...");
-    int contour_count = trace_contour(binary, width, height, contour, MAX_CONTOUR_POINTS);
-    if (contour_count < 3) {
+    // Step 1.7: ROI mask — zero out edges near image borders to eliminate surface noise
+    {
+        int margin_x = width * ROI_MARGIN_PERCENT / 100;
+        int margin_y = height * ROI_MARGIN_PERCENT / 100;
+        ESP_LOGI(TAG, "Step 1.7: ROI mask (margin %d%%: x=%d, y=%d)...", ROI_MARGIN_PERCENT, margin_x, margin_y);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (x < margin_x || x >= width - margin_x || y < margin_y || y >= height - margin_y) {
+                    binary[y * width + x] = 0;
+                }
+            }
+        }
+    }
+
+    // Step 2: Trace contours and pick the largest
+    int min_bbox_area = (width * height * MIN_BBOX_AREA_PCT) / 100;
+    ESP_LOGI(TAG, "Step 2: Tracing contours (up to %d, min_area=%d)...", MAX_CONTOUR_SEARCH, min_bbox_area);
+    int best_contour_count = 0;
+    int best_area = 0;
+    int best_attempt = -1;
+
+    for (int attempt = 0; attempt < MAX_CONTOUR_SEARCH; attempt++) {
+        int contour_count = trace_contour(binary, width, height, contour, MAX_CONTOUR_POINTS);
+        if (contour_count < 3) {
+            ESP_LOGI(TAG, "Contour search: attempt %d, %d points — stopping", attempt, contour_count);
+            break;
+        }
+
+        // Compute axis-aligned bounding box area
+        int min_x = contour[0].x, max_x = contour[0].x;
+        int min_y = contour[0].y, max_y = contour[0].y;
+        for (int i = 1; i < contour_count; i++) {
+            if (contour[i].x < min_x) min_x = contour[i].x;
+            if (contour[i].x > max_x) max_x = contour[i].x;
+            if (contour[i].y < min_y) min_y = contour[i].y;
+            if (contour[i].y > max_y) max_y = contour[i].y;
+        }
+        int bbox_area = (max_x - min_x) * (max_y - min_y);
+        ESP_LOGI(TAG, "Contour search: attempt %d, %d points, bbox_area=%d%s", attempt, contour_count, bbox_area,
+                 bbox_area < min_bbox_area ? " (too small, skipped)" : "");
+
+        // Skip contours that are too small (noise)
+        if (bbox_area < min_bbox_area) {
+            // Still erase it so we don't re-trace it
+            goto erase_contour;
+        }
+
+        // Keep the largest contour (stored temporarily in hull buffer)
+        if (bbox_area > best_area) {
+            best_area = bbox_area;
+            best_contour_count = contour_count;
+            best_attempt = attempt;
+            memcpy(hull, contour, contour_count * sizeof(point_t));
+        }
+
+        // Erase this contour from the binary image (3x3 neighborhood) so next iteration finds a different one
+        erase_contour:
+        for (int i = 0; i < contour_count; i++) {
+            int cx = contour[i].x;
+            int cy = contour[i].y;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int nx = cx + dx;
+                    int ny = cy + dy;
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                        binary[ny * width + nx] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    if (best_contour_count < 3) {
         ESP_LOGW(TAG, "Not enough contour points!");
         goto cleanup;
     }
+
+    // Copy best contour from hull back into contour
+    ESP_LOGI(TAG, "Best contour: %d points (attempt %d, bbox_area=%d)", best_contour_count, best_attempt, best_area);
+    memcpy(contour, hull, best_contour_count * sizeof(point_t));
+    int contour_count = best_contour_count;
 
     // Step 3: Convex hull
     ESP_LOGI(TAG, "Step 3: Computing convex hull...");
@@ -852,7 +939,7 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height)
 
     // Step 4: Min area rectangle
     ESP_LOGI(TAG, "Step 4: Finding minimum area rectangle...");
-    result = find_min_area_rect(hull, hull_count);
+    result = find_min_area_rect(hull, hull_count, pixels_per_mm);
 
     // Draw result on original image
     if (result.valid) {
@@ -943,21 +1030,19 @@ void app_main(void)
         return;
     }
 
+
     // Step 0: Connect WiFi and fetch calibration factor from server
     bool wifi_ok = wifi_init();
     if (wifi_ok) {
         fetch_cal_factor();
     }
 
-    // Measure distance with ultrasonic sensor (while WiFi is still on, before HX711)
+    // Measure actual distance for reference, but use fixed baseline
     ultrasonic_init();
-    ESP_LOGI(TAG, ">>> Measuring distance...");
-    g_distance_cm = ultrasonic_measure();
-    if (g_distance_cm > 0) {
-        ESP_LOGI(TAG, ">>> Distance: %.2f cm", g_distance_cm);
-    } else {
-        ESP_LOGW(TAG, ">>> Distance: N/A (sensor error)");
-    }
+    float measured_baseline = ultrasonic_measure();
+    ESP_LOGI(TAG, ">>> Measured distance (no object): %.2f cm", measured_baseline);
+    g_baseline_cm = FIXED_BASELINE_CM;
+    ESP_LOGI(TAG, ">>> Using fixed baseline: %.2f cm", g_baseline_cm);
 
     // Stop WiFi during HX711 readings — RF noise interferes with the 24-bit ADC
     ESP_LOGI(TAG, "Stopping WiFi for clean HX711 readings...");
@@ -985,6 +1070,23 @@ void app_main(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Now place object under camera... (5 seconds)");
     vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Step 3.5: Second ultrasonic reading (with object)
+    ESP_LOGI(TAG, ">>> Measuring object distance...");
+    g_object_cm = ultrasonic_measure();
+    ESP_LOGI(TAG, ">>> Ultrasonic raw reading: %.2f cm (baseline=%.2f cm)", g_object_cm, g_baseline_cm);
+    if (g_object_cm > 0 && g_baseline_cm > 0) {
+        g_object_height_cm = g_baseline_cm - g_object_cm;
+        if (g_object_height_cm < 0) g_object_height_cm = 0;
+        g_dynamic_ppmm = PIXELS_PER_MM_REF * (CALIBRATION_DIST_CM / g_object_cm);
+        ESP_LOGI(TAG, ">>> Object distance: %.2f cm", g_object_cm);
+        ESP_LOGI(TAG, ">>> Object height:   %.2f cm", g_object_height_cm);
+        ESP_LOGI(TAG, ">>> Dynamic ppmm:    %.4f (ref %.4f at %.1f cm)",
+                 g_dynamic_ppmm, PIXELS_PER_MM_REF, CALIBRATION_DIST_CM);
+    } else {
+        ESP_LOGW(TAG, ">>> Object distance: N/A — using reference ppmm");
+        g_dynamic_ppmm = PIXELS_PER_MM_REF;
+    }
 
     // Step 4: Capture image
     ESP_LOGI(TAG, ">>> Capturing image...");
@@ -1015,7 +1117,7 @@ void app_main(void)
     // Process: find min area rectangle (this modifies img_copy)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Processing image...");
-    min_area_rect_t rect = process_image(img_copy, img_width, img_height);
+    min_area_rect_t rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
 
     // Print results
     ESP_LOGI(TAG, "");
@@ -1027,22 +1129,33 @@ void app_main(void)
         ESP_LOGI(TAG, "║  Angle:  %.1f°                        ", rect.angle);
         ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
         ESP_LOGI(TAG, "║  Size (pixels):                       ║");
-        ESP_LOGI(TAG, "║    Width:  %.1f px                    ", rect.width);
-        ESP_LOGI(TAG, "║    Height: %.1f px                    ", rect.height);
+        ESP_LOGI(TAG, "║    Length: %.1f px                    ", rect.width);
+        ESP_LOGI(TAG, "║    Width:  %.1f px                    ", rect.height);
         ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Size (mm):                           ║");
+        ESP_LOGI(TAG, "║  Dimensions:                          ║");
+        ESP_LOGI(TAG, "║    Length: %.1f mm                    ", rect.length_mm);
         ESP_LOGI(TAG, "║    Width:  %.1f mm                    ", rect.width_mm);
-        ESP_LOGI(TAG, "║    Height: %.1f mm                    ", rect.height_mm);
+        if (g_object_cm > 0) {
+            ESP_LOGI(TAG, "║    Height: %.2f cm (%.1f mm)          ", g_object_height_cm, g_object_height_cm * 10.0f);
+        } else {
+            ESP_LOGI(TAG, "║    Height: N/A                        ║");
+        }
         ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
         ESP_LOGI(TAG, "║  Weight:                              ║");
         ESP_LOGI(TAG, "║    %.1f g  (%.3f kg)                  ", weight_g, weight_g / 1000.0f);
         ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Distance:                            ║");
-        if (g_distance_cm > 0) {
-            ESP_LOGI(TAG, "║    %.2f cm                            ", g_distance_cm);
+        ESP_LOGI(TAG, "║  Ultrasonic:                          ║");
+        if (g_baseline_cm > 0) {
+            ESP_LOGI(TAG, "║    Baseline:  %.2f cm                 ", g_baseline_cm);
         } else {
-            ESP_LOGI(TAG, "║    N/A                                ║");
+            ESP_LOGI(TAG, "║    Baseline:  N/A                     ║");
         }
+        if (g_object_cm > 0) {
+            ESP_LOGI(TAG, "║    Object:    %.2f cm                 ", g_object_cm);
+        } else {
+            ESP_LOGI(TAG, "║    Object:    N/A                     ║");
+        }
+        ESP_LOGI(TAG, "║    PPMM:      %.4f                   ", g_dynamic_ppmm);
         ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
     } else {
         ESP_LOGW(TAG, "No object detected!");

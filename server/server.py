@@ -73,22 +73,26 @@ def upload():
         "image": img_filename,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "valid": request.args.get("valid", "0") == "1",
+        "length_mm": float(request.args.get("length_mm", 0)),
         "width_mm": float(request.args.get("width_mm", 0)),
-        "height_mm": float(request.args.get("height_mm", 0)),
+        "length_px": float(request.args.get("length_px", 0)),
         "width_px": float(request.args.get("width_px", 0)),
-        "height_px": float(request.args.get("height_px", 0)),
         "angle": float(request.args.get("angle", 0)),
         "weight_g": float(request.args.get("weight_g", 0)),
         "raw_tare": int(request.args.get("raw_tare", 0)),
         "raw_avg": int(request.args.get("raw_avg", 0)),
-        "distance_cm": float(request.args.get("distance_cm", -1)),
+        "baseline_cm": float(request.args.get("baseline_cm", -1)),
+        "object_cm": float(request.args.get("object_cm", -1)),
+        "height_cm": float(request.args.get("height_cm", 0)),
+        "pixels_per_mm": float(request.args.get("pixels_per_mm", 0)),
     }
 
     measurements = load_measurements()
     measurements.insert(0, entry)
     save_measurements(measurements)
 
-    print(f"  -> {entry['width_mm']:.1f} x {entry['height_mm']:.1f} mm, {entry['weight_g']:.1f} g, dist={entry['distance_cm']:.2f} cm")
+    print(f"  -> L={entry['length_mm']:.1f} x W={entry['width_mm']:.1f} mm, H={entry['height_cm']:.2f} cm, "
+          f"{entry['weight_g']:.1f} g, ppmm={entry['pixels_per_mm']:.4f}")
     return {"status": "ok", "filename": img_filename}, 200
 
 
@@ -174,6 +178,7 @@ PAGE_TEMPLATE = """
         .dim-value.wt { color: #ffb74d; }
         .dim-value.a { color: #ce93d8; }
         .dim-value.d { color: #e57373; }
+        .dim-value.ht { color: #f06292; }
         .dim-sub { color: #666; font-size: 11px; }
         .no-detect { color: #ef5350; font-style: italic; padding: 10px; text-align: center; }
         .empty { color: #555; text-align: center; padding: 60px; font-size: 16px; }
@@ -230,14 +235,23 @@ PAGE_TEMPLATE = """
                 {% if m.valid %}
                 <div class="dims">
                     <div class="dim-box">
+                        <div class="dim-label">Length</div>
+                        <div class="dim-value w">{{ "%.2f"|format(m.get('length_mm', m.get('width_mm', 0)) / 10) }} cm</div>
+                        <div class="dim-sub">{{ "%.1f"|format(m.get('length_mm', m.get('width_mm', 0))) }} mm</div>
+                    </div>
+                    <div class="dim-box">
                         <div class="dim-label">Width</div>
-                        <div class="dim-value w">{{ "%.2f"|format(m.width_mm / 10) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.width_mm) }} mm</div>
+                        <div class="dim-value h">{{ "%.2f"|format(m.get('width_mm', 0) / 10) }} cm</div>
+                        <div class="dim-sub">{{ "%.1f"|format(m.get('width_mm', 0)) }} mm</div>
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Height</div>
-                        <div class="dim-value h">{{ "%.2f"|format(m.height_mm / 10) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.height_mm) }} mm</div>
+                        {% if m.get('height_cm', m.get('object_height_cm', 0)) > 0 %}
+                        <div class="dim-value ht">{{ "%.2f"|format(m.get('height_cm', m.get('object_height_cm', 0))) }} cm</div>
+                        <div class="dim-sub">{{ "%.1f"|format(m.get('height_cm', m.get('object_height_cm', 0)) * 10) }} mm</div>
+                        {% else %}
+                        <div class="dim-value ht">N/A</div>
+                        {% endif %}
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Weight</div>
@@ -249,16 +263,17 @@ PAGE_TEMPLATE = """
                         <div class="dim-value a">{{ "%.1f"|format(m.angle) }}&deg;</div>
                         <div class="dim-sub">rotation</div>
                     </div>
-                    <div class="dim-box" style="grid-column: span 2;">
-                        <div class="dim-label">Distance</div>
-                        {% if m.get('distance_cm', -1) > 0 %}
-                        <div class="dim-value d">{{ "%.2f"|format(m.distance_cm) }} cm</div>
+                    <div class="dim-box">
+                        <div class="dim-label">Ultrasonic</div>
+                        {% if m.get('object_cm', -1) > 0 %}
+                        <div class="dim-value d">{{ "%.2f"|format(m.get('object_cm', 0)) }} cm</div>
+                        <div class="dim-sub">baseline: {{ "%.2f"|format(m.get('baseline_cm', 0)) }} cm</div>
                         {% else %}
                         <div class="dim-value d">N/A</div>
                         {% endif %}
                     </div>
                 </div>
-                <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}</div>
+                <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} | ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
                 {% else %}
                 <div class="no-detect">No object detected</div>
                 {% endif %}
