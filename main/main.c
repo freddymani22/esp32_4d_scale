@@ -116,8 +116,10 @@ static int32_t hx711_read_raw(void)
         return 0;
     }
 
-    // Read 24 bits
+    // Read 24 bits — disable interrupts to prevent bit-bang corruption
     int32_t data = 0;
+    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    taskENTER_CRITICAL(&mux);
     for (int i = 0; i < 24; i++) {
         gpio_set_level(HX711_SCK_PIN, 1);
         ets_delay_us(1);
@@ -131,6 +133,7 @@ static int32_t hx711_read_raw(void)
     ets_delay_us(1);
     gpio_set_level(HX711_SCK_PIN, 0);
     ets_delay_us(1);
+    taskEXIT_CRITICAL(&mux);
 
     // Convert from 24-bit two's complement
     if (data & 0x800000) {
@@ -169,22 +172,56 @@ static void hx711_init(void)
 
 static int32_t hx711_tare = 0;
 
+#define HX711_NUM_READINGS 20
+
+static int cmp_int32(const void *a, const void *b)
+{
+    int32_t va = *(const int32_t *)a;
+    int32_t vb = *(const int32_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+// Read N samples, discard zeros, sort, trim outer 25% (IQR), average the middle 50%
+static int32_t hx711_read_filtered(const char *label)
+{
+    int32_t readings[HX711_NUM_READINGS];
+    int valid = 0;
+
+    for (int i = 0; i < HX711_NUM_READINGS; i++) {
+        int32_t raw = hx711_read_raw();
+        ESP_LOGI(TAG, "  %s[%d]: %ld", label, i + 1, (long)raw);
+        if (raw != 0) {
+            readings[valid++] = raw;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (valid == 0) return 0;
+
+    qsort(readings, valid, sizeof(int32_t), cmp_int32);
+
+    // Trim outer 25% on each side, average the middle 50%
+    int trim = valid / 4;
+    int start = trim;
+    int end = valid - trim;
+    if (end <= start) { start = 0; end = valid; }  // fallback if too few
+
+    int64_t sum = 0;
+    for (int i = start; i < end; i++) {
+        sum += readings[i];
+    }
+    int32_t result = (int32_t)(sum / (end - start));
+
+    ESP_LOGI(TAG, "  %s result: %ld (trimmed mean of [%d..%d] from %d valid, range: %ld to %ld)",
+             label, (long)result, start, end - 1, valid,
+             (long)readings[0], (long)readings[valid - 1]);
+    return result;
+}
+
 static void hx711_read_tare(void)
 {
     ESP_LOGI(TAG, ">>> Reading tare (empty plywood)...");
-    int32_t total = 0;
-    int valid = 0;
-    for (int i = 0; i < 10; i++) {
-        int32_t raw = hx711_read_raw();
-        ESP_LOGI(TAG, "  Tare[%d]: %ld", i + 1, (long)raw);
-        if (raw != 0) {
-            total += raw;
-            valid++;
-        }
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-    hx711_tare = (valid > 0) ? total / valid : 0;
-    ESP_LOGI(TAG, "  Tare average: %ld (%d valid readings)", (long)hx711_tare, valid);
+    hx711_tare = hx711_read_filtered("Tare");
 }
 
 static int32_t hx711_raw_avg = 0;  // stored for upload to server
@@ -195,20 +232,13 @@ static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
 
 static float hx711_read_grams(void)
 {
-    int32_t total = 0;
-    for (int i = 0; i < 10; i++) {
-        int32_t raw = hx711_read_raw();
-        total += raw;
-        ESP_LOGI(TAG, "  Weight read[%d]: %ld", i + 1, (long)raw);
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-    int32_t avg = total / 10;
-    hx711_raw_avg = avg;
-    int32_t diff = avg - hx711_tare;
+    int32_t filtered = hx711_read_filtered("Weight");
+    hx711_raw_avg = filtered;
+    int32_t diff = filtered - hx711_tare;
     float grams = fabsf((float)diff) / hx711_cal_factor;
     if (grams < 2.0f) grams = 0;  // noise floor
-    ESP_LOGI(TAG, "Weight: %.1f g (raw avg: %ld, tare: %ld, diff: %ld, cal: %.4f)",
-             grams, (long)avg, (long)hx711_tare, (long)diff, hx711_cal_factor);
+    ESP_LOGI(TAG, "Weight: %.1f g (filtered: %ld, tare: %ld, diff: %ld, cal: %.4f)",
+             grams, (long)filtered, (long)hx711_tare, (long)diff, hx711_cal_factor);
     return grams;
 }
 
@@ -1030,7 +1060,6 @@ void app_main(void)
         return;
     }
 
-
     // Step 0: Connect WiFi and fetch calibration factor from server
     bool wifi_ok = wifi_init();
     if (wifi_ok) {
@@ -1092,6 +1121,7 @@ void app_main(void)
     ESP_LOGI(TAG, ">>> Capturing image...");
 
     camera_fb_t *fb = esp_camera_fb_get();
+
     if (!fb) {
         ESP_LOGE(TAG, "Capture failed!");
         return;
