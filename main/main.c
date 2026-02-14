@@ -47,15 +47,17 @@ static int s_retry_num = 0;
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define SOBEL_THRESHOLD     130     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
-#define DILATION_ITERATIONS 3       // Close edge gaps after Sobel (increase if contour has breaks)
+#define DIFF_THRESHOLD      50      // Background subtraction: min pixel difference to count as object
+#define BLUR_RADIUS         2       // Box blur radius before subtraction (suppresses grain/noise)
+#define EROSION_ITERATIONS  2       // Morphological opening: erode to remove shadow fringe
+#define DILATION_ITERATIONS 3       // Morphological opening: dilate to restore object shape
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define MAX_CONTOUR_SEARCH  10      // Max contours to evaluate before picking the largest
 #define ROI_MARGIN_PERCENT  5       // Ignore outer N% of image on each side (eliminates surface edge noise)
 #define MIN_BBOX_AREA_PCT   2       // Minimum contour bounding box as % of image area (rejects tiny noise)
-#define PIXELS_PER_MM_REF   0.99f   // Calibrated at reference distance
-#define CALIBRATION_DIST_CM 34.5f   // Reference distance (cm) for PIXELS_PER_MM_REF
-#define FIXED_BASELINE_CM      34.5f  // Fixed baseline distance (sensor to surface) in cm
+#define PIXELS_PER_MM_REF   0.653f  // Calibrated at reference distance (48.1 cm)
+#define CALIBRATION_DIST_CM 48.1f   // Reference distance (cm) for PIXELS_PER_MM_REF
+#define FIXED_BASELINE_CM      48.1f  // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
 
 // AI-Thinker ESP32-CAM Pin Mapping
@@ -172,7 +174,7 @@ static void hx711_init(void)
 
 static int32_t hx711_tare = 0;
 
-#define HX711_NUM_READINGS 20
+#define HX711_NUM_READINGS 10
 
 static int cmp_int32(const void *a, const void *b)
 {
@@ -229,6 +231,9 @@ static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
 static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
+
+static uint8_t *g_reference = NULL;  // Reference image (empty surface)
+static int g_ref_width = 0, g_ref_height = 0;
 
 static float hx711_read_grams(void)
 {
@@ -615,6 +620,71 @@ static void apply_dilation(uint8_t *img, int width, int height, int iterations)
     heap_caps_free(temp);
 }
 
+// ============== STEP 1: EROSION (for morphological opening) ==============
+
+static void apply_erosion(uint8_t *img, int width, int height, int iterations)
+{
+    uint8_t *temp = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
+    if (!temp) return;
+
+    for (int iter = 0; iter < iterations; iter++) {
+        memcpy(temp, img, width * height);
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x++) {
+                bool all_white = true;
+                for (int dy = -1; dy <= 1 && all_white; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (temp[(y + dy) * width + (x + dx)] == 0) {
+                            all_white = false;
+                            break;
+                        }
+                    }
+                }
+                img[y * width + x] = all_white ? 255 : 0;
+            }
+        }
+    }
+    heap_caps_free(temp);
+}
+
+// ============== BOX BLUR (suppresses grain/sensor noise) ==============
+
+static void apply_box_blur(uint8_t *src, uint8_t *dst, int width, int height, int radius)
+{
+    int kernel = 2 * radius + 1;
+    int area = kernel * kernel;
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int sum = 0;
+            for (int dy = -radius; dy <= radius; dy++) {
+                int ny = y + dy;
+                if (ny < 0) ny = 0;
+                if (ny >= height) ny = height - 1;
+                for (int dx = -radius; dx <= radius; dx++) {
+                    int nx = x + dx;
+                    if (nx < 0) nx = 0;
+                    if (nx >= width) nx = width - 1;
+                    sum += src[ny * width + nx];
+                }
+            }
+            dst[y * width + x] = (uint8_t)(sum / area);
+        }
+    }
+}
+
+// ============== STEP 1: BACKGROUND SUBTRACTION ==============
+
+static void background_subtract(uint8_t *current, uint8_t *reference,
+                                 uint8_t *binary, int width, int height,
+                                 int diff_threshold)
+{
+    for (int i = 0; i < width * height; i++) {
+        int diff = abs((int)current[i] - (int)reference[i]);
+        binary[i] = (diff > diff_threshold) ? 255 : 0;
+    }
+}
+
 // ============== STEP 2: CONTOUR TRACING (Moore Boundary) ==============
 
 // 8-connected neighbor offsets (clockwise from right)
@@ -858,26 +928,41 @@ static void draw_min_area_rect(uint8_t *img, int width, int height, min_area_rec
 
 // ============== MAIN PROCESSING FUNCTION ==============
 
-static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, float pixels_per_mm)
+static min_area_rect_t process_image(uint8_t *grayscale, uint8_t *reference,
+                                     int width, int height, float pixels_per_mm)
 {
     min_area_rect_t result = {0};
 
     // Allocate buffers in PSRAM
     uint8_t *binary = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *blurred_cur = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
+    uint8_t *blurred_ref = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
     point_t *contour = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
     point_t *hull = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
 
-    if (!binary || !contour || !hull) {
+    if (!binary || !blurred_cur || !blurred_ref || !contour || !hull) {
         ESP_LOGE(TAG, "Failed to allocate processing buffers!");
         goto cleanup;
     }
 
-    // Step 1: Sobel edge detection
-    ESP_LOGI(TAG, "Step 1: Sobel edge detection (threshold=%d)...", SOBEL_THRESHOLD);
-    apply_sobel(grayscale, binary, width, height, SOBEL_THRESHOLD);
+    // Step 0.5: Blur both images to suppress plywood grain and sensor noise
+    ESP_LOGI(TAG, "Step 0.5: Box blur (radius=%d) to suppress grain...", BLUR_RADIUS);
+    apply_box_blur(grayscale, blurred_cur, width, height, BLUR_RADIUS);
+    apply_box_blur(reference, blurred_ref, width, height, BLUR_RADIUS);
 
-    // Step 1.5: Dilation to close edge gaps
-    ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
+    // Step 1: Background subtraction on blurred images
+    ESP_LOGI(TAG, "Step 1: Background subtraction (threshold=%d)...", DIFF_THRESHOLD);
+    background_subtract(blurred_cur, blurred_ref, binary, width, height, DIFF_THRESHOLD);
+
+    heap_caps_free(blurred_cur);
+    heap_caps_free(blurred_ref);
+    blurred_cur = NULL;
+    blurred_ref = NULL;
+
+    // Step 1.5: Morphological opening (erode then dilate) to remove shadows
+    ESP_LOGI(TAG, "Step 1.5: Morphological opening (erode=%d, dilate=%d)...",
+             EROSION_ITERATIONS, DILATION_ITERATIONS);
+    apply_erosion(binary, width, height, EROSION_ITERATIONS);
     apply_dilation(binary, width, height, DILATION_ITERATIONS);
 
     // Step 1.7: ROI mask — zero out edges near image borders to eliminate surface noise
@@ -978,6 +1063,8 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
 
 cleanup:
     if (binary) heap_caps_free(binary);
+    if (blurred_cur) heap_caps_free(blurred_cur);
+    if (blurred_ref) heap_caps_free(blurred_ref);
     if (contour) heap_caps_free(contour);
     if (hull) heap_caps_free(hull);
 
@@ -1040,6 +1127,34 @@ static esp_err_t init_camera(void)
     return ESP_OK;
 }
 
+static void lock_camera_settings(void)
+{
+    // Let auto-exposure settle by discarding several frames
+    ESP_LOGI(TAG, "Letting camera auto-expose settle...");
+    for (int i = 0; i < 10; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+
+    // Read the auto-determined values before locking
+    s->get_reg(s, 0, 0);  // Force status update
+    int cur_aec = s->status.aec_value;
+    int cur_agc = s->status.agc_gain;
+
+    // Now freeze at the auto-determined values
+    s->set_exposure_ctrl(s, 0);    // Disable auto exposure
+    s->set_gain_ctrl(s, 0);        // Disable auto gain
+    s->set_whitebal(s, 0);         // Disable auto white balance
+    s->set_aec2(s, 0);             // Disable AEC DSP
+    s->set_aec_value(s, cur_aec);  // Lock at current exposure
+    s->set_agc_gain(s, cur_agc);   // Lock at current gain
+
+    ESP_LOGI(TAG, "Camera settings locked (aec=%d, agc=%d)", cur_aec, cur_agc);
+}
+
 // ============== MAIN ==============
 
 void app_main(void)
@@ -1059,6 +1174,7 @@ void app_main(void)
         ESP_LOGE(TAG, "Camera required!");
         return;
     }
+    lock_camera_settings();
 
     // Step 0: Connect WiFi and fetch calibration factor from server
     bool wifi_ok = wifi_init();
@@ -1081,12 +1197,34 @@ void app_main(void)
     hx711_init();
     hx711_read_tare();
 
-    // Step 2: Place object on load cell and weigh
+    // Capture reference image now (surface is empty, right before object placement)
+    ESP_LOGI(TAG, ">>> Capturing reference image (empty surface)...");
+    for (int i = 0; i < 3; i++) {
+        camera_fb_t *discard = esp_camera_fb_get();
+        if (discard) esp_camera_fb_return(discard);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    camera_fb_t *ref_fb = esp_camera_fb_get();
+    if (ref_fb) {
+        g_ref_width = ref_fb->width;
+        g_ref_height = ref_fb->height;
+        g_reference = heap_caps_malloc(g_ref_width * g_ref_height, MALLOC_CAP_SPIRAM);
+        if (g_reference) {
+            memcpy(g_reference, ref_fb->buf, g_ref_width * g_ref_height);
+            ESP_LOGI(TAG, ">>> Reference captured: %dx%d", g_ref_width, g_ref_height);
+        } else {
+            ESP_LOGW(TAG, ">>> Failed to allocate reference buffer!");
+        }
+        esp_camera_fb_return(ref_fb);
+    } else {
+        ESP_LOGW(TAG, ">>> Failed to capture reference image!");
+    }
+
+    // Step 2: Place object on the scale (which is under the camera)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Place object on the scale... (5 seconds)");
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(TAG, ">>> Settling... (3 seconds)");
-    // Discard a few readings while load cell settles
     for (int i = 0; i < 5; i++) {
         hx711_read_raw();
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -1095,12 +1233,7 @@ void app_main(void)
     float weight_g = hx711_read_grams();
     ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
 
-    // Step 3: Place object under camera
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> Now place object under camera... (5 seconds)");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    // Step 3.5: Second ultrasonic reading (with object)
+    // Step 3: Ultrasonic reading (object is on surface)
     ESP_LOGI(TAG, ">>> Measuring object distance...");
     g_object_cm = ultrasonic_measure();
     ESP_LOGI(TAG, ">>> Ultrasonic raw reading: %.2f cm (baseline=%.2f cm)", g_object_cm, g_baseline_cm);
@@ -1117,9 +1250,16 @@ void app_main(void)
         g_dynamic_ppmm = PIXELS_PER_MM_REF;
     }
 
-    // Step 4: Capture image
-    ESP_LOGI(TAG, ">>> Capturing image...");
+    // Step 4: Capture image (object is on the surface)
+    // Discard stale frames — buffer has been holding an old frame since reference capture
+    ESP_LOGI(TAG, ">>> Flushing stale camera frames...");
+    for (int i = 0; i < 5; i++) {
+        camera_fb_t *discard = esp_camera_fb_get();
+        if (discard) esp_camera_fb_return(discard);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
+    ESP_LOGI(TAG, ">>> Capturing fresh image (with object)...");
     camera_fb_t *fb = esp_camera_fb_get();
 
     if (!fb) {
@@ -1147,7 +1287,10 @@ void app_main(void)
     // Process: find min area rectangle (this modifies img_copy)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Processing image...");
-    min_area_rect_t rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
+    if (!g_reference) {
+        ESP_LOGW(TAG, ">>> No reference image — background subtraction may be unreliable!");
+    }
+    min_area_rect_t rect = process_image(img_copy, g_reference, img_width, img_height, g_dynamic_ppmm);
 
     // Print results
     ESP_LOGI(TAG, "");
