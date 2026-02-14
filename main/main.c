@@ -47,13 +47,12 @@ static int s_retry_num = 0;
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define DIFF_THRESHOLD      50      // Background subtraction: min pixel difference to count as object
-#define BLUR_RADIUS         2       // Box blur radius before subtraction (suppresses grain/noise)
-#define EROSION_ITERATIONS  2       // Morphological opening: erode to remove shadow fringe
-#define DILATION_ITERATIONS 3       // Morphological opening: dilate to restore object shape
+#define DOWNSCALE_FACTOR    4       // Downscale NxN to 1 pixel (kills texture, 320x240 → 80x60)
+#define EROSION_ITERATIONS  1       // Morphological cleanup: erode to remove noise fringe
+#define DILATION_ITERATIONS 2       // Morphological cleanup: dilate to restore object shape
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define MAX_CONTOUR_SEARCH  10      // Max contours to evaluate before picking the largest
-#define ROI_MARGIN_PERCENT  5       // Ignore outer N% of image on each side (eliminates surface edge noise)
+#define ROI_MARGIN_PERCENT  15      // Ignore outer N% of image on each side (excludes table around plywood)
 #define MIN_BBOX_AREA_PCT   2       // Minimum contour bounding box as % of image area (rejects tiny noise)
 #define PIXELS_PER_MM_REF   0.653f  // Calibrated at reference distance (48.1 cm)
 #define CALIBRATION_DIST_CM 48.1f   // Reference distance (cm) for PIXELS_PER_MM_REF
@@ -231,9 +230,6 @@ static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
 static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
-
-static uint8_t *g_reference = NULL;  // Reference image (empty surface)
-static int g_ref_width = 0, g_ref_height = 0;
 
 static float hx711_read_grams(void)
 {
@@ -549,48 +545,80 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
     return success;
 }
 
-// ============== STEP 1: SOBEL EDGE DETECTION ==============
+// ============== STEP 1: DOWNSCALE + OTSU THRESHOLDING ==============
 
-static void apply_sobel(uint8_t *src, uint8_t *dst, int width, int height, int edge_thresh)
+// Downscale image by averaging NxN blocks
+static void downscale(uint8_t *src, int src_w, int src_h,
+                      uint8_t *dst, int dst_w, int dst_h, int factor)
 {
-    // Sobel kernels:
-    // Gx: [-1, 0, 1]    Gy: [-1, -2, -1]
-    //     [-2, 0, 2]        [ 0,  0,  0]
-    //     [-1, 0, 1]        [ 1,  2,  1]
-
-    // Border pixels: no edge
-    for (int x = 0; x < width; x++) {
-        dst[x] = 0;
-        dst[(height - 1) * width + x] = 0;
-    }
-    for (int y = 0; y < height; y++) {
-        dst[y * width] = 0;
-        dst[y * width + width - 1] = 0;
-    }
-
-    for (int y = 1; y < height - 1; y++) {
-        for (int x = 1; x < width - 1; x++) {
-            int p00 = src[(y - 1) * width + (x - 1)];
-            int p01 = src[(y - 1) * width +  x];
-            int p02 = src[(y - 1) * width + (x + 1)];
-            int p10 = src[ y      * width + (x - 1)];
-            int p12 = src[ y      * width + (x + 1)];
-            int p20 = src[(y + 1) * width + (x - 1)];
-            int p21 = src[(y + 1) * width +  x];
-            int p22 = src[(y + 1) * width + (x + 1)];
-
-            int gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
-            int gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
-
-            // Manhattan magnitude (avoids sqrt, range 0-2040)
-            int mag = abs(gx) + abs(gy);
-            dst[y * width + x] = (mag > edge_thresh) ? 255 : 0;
+    int block_area = factor * factor;
+    for (int dy = 0; dy < dst_h; dy++) {
+        for (int dx = 0; dx < dst_w; dx++) {
+            int sum = 0;
+            int sy0 = dy * factor;
+            int sx0 = dx * factor;
+            for (int by = 0; by < factor && (sy0 + by) < src_h; by++) {
+                for (int bx = 0; bx < factor && (sx0 + bx) < src_w; bx++) {
+                    sum += src[(sy0 + by) * src_w + (sx0 + bx)];
+                }
+            }
+            dst[dy * dst_w + dx] = (uint8_t)(sum / block_area);
         }
     }
 }
 
-// ============== STEP 1.5: DILATION (Close edge gaps) ==============
-// Dilation expands edge pixels - closes small gaps so contour tracer can follow
+// Upscale binary mask by replicating each pixel into NxN block
+static void upscale_mask(uint8_t *small, int sm_w, int sm_h,
+                         uint8_t *big, int big_w, int big_h, int factor)
+{
+    for (int sy = 0; sy < sm_h; sy++) {
+        for (int sx = 0; sx < sm_w; sx++) {
+            uint8_t val = small[sy * sm_w + sx];
+            int by0 = sy * factor;
+            int bx0 = sx * factor;
+            for (int by = 0; by < factor && (by0 + by) < big_h; by++) {
+                for (int bx = 0; bx < factor && (bx0 + bx) < big_w; bx++) {
+                    big[(by0 + by) * big_w + (bx0 + bx)] = val;
+                }
+            }
+        }
+    }
+}
+
+// Otsu's method: find optimal threshold that maximizes inter-class variance
+static int otsu_threshold(uint8_t *img, int size)
+{
+    int hist[256] = {0};
+    for (int i = 0; i < size; i++) hist[img[i]]++;
+
+    float sum = 0;
+    for (int i = 0; i < 256; i++) sum += (float)i * hist[i];
+
+    float sumB = 0;
+    int wB = 0, wF = 0;
+    float max_var = 0;
+    int threshold = 128;
+
+    for (int t = 0; t < 256; t++) {
+        wB += hist[t];
+        if (wB == 0) continue;
+        wF = size - wB;
+        if (wF == 0) break;
+
+        sumB += (float)t * hist[t];
+        float mB = sumB / wB;
+        float mF = (sum - sumB) / wF;
+        float var = (float)wB * (float)wF * (mB - mF) * (mB - mF);
+
+        if (var > max_var) {
+            max_var = var;
+            threshold = t;
+        }
+    }
+    return threshold;
+}
+
+// ============== MORPHOLOGICAL OPERATIONS ==============
 
 static void apply_dilation(uint8_t *img, int width, int height, int iterations)
 {
@@ -645,44 +673,6 @@ static void apply_erosion(uint8_t *img, int width, int height, int iterations)
         }
     }
     heap_caps_free(temp);
-}
-
-// ============== BOX BLUR (suppresses grain/sensor noise) ==============
-
-static void apply_box_blur(uint8_t *src, uint8_t *dst, int width, int height, int radius)
-{
-    int kernel = 2 * radius + 1;
-    int area = kernel * kernel;
-
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int sum = 0;
-            for (int dy = -radius; dy <= radius; dy++) {
-                int ny = y + dy;
-                if (ny < 0) ny = 0;
-                if (ny >= height) ny = height - 1;
-                for (int dx = -radius; dx <= radius; dx++) {
-                    int nx = x + dx;
-                    if (nx < 0) nx = 0;
-                    if (nx >= width) nx = width - 1;
-                    sum += src[ny * width + nx];
-                }
-            }
-            dst[y * width + x] = (uint8_t)(sum / area);
-        }
-    }
-}
-
-// ============== STEP 1: BACKGROUND SUBTRACTION ==============
-
-static void background_subtract(uint8_t *current, uint8_t *reference,
-                                 uint8_t *binary, int width, int height,
-                                 int diff_threshold)
-{
-    for (int i = 0; i < width * height; i++) {
-        int diff = abs((int)current[i] - (int)reference[i]);
-        binary[i] = (diff > diff_threshold) ? 255 : 0;
-    }
 }
 
 // ============== STEP 2: CONTOUR TRACING (Moore Boundary) ==============
@@ -928,56 +918,116 @@ static void draw_min_area_rect(uint8_t *img, int width, int height, min_area_rec
 
 // ============== MAIN PROCESSING FUNCTION ==============
 
-static min_area_rect_t process_image(uint8_t *grayscale, uint8_t *reference,
-                                     int width, int height, float pixels_per_mm)
+static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, float pixels_per_mm)
 {
     min_area_rect_t result = {0};
 
+    int sm_w = width / DOWNSCALE_FACTOR;
+    int sm_h = height / DOWNSCALE_FACTOR;
+
     // Allocate buffers in PSRAM
     uint8_t *binary = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *blurred_cur = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
-    uint8_t *blurred_ref = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
+    uint8_t *small = heap_caps_malloc(sm_w * sm_h, MALLOC_CAP_SPIRAM);
     point_t *contour = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
     point_t *hull = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
 
-    if (!binary || !blurred_cur || !blurred_ref || !contour || !hull) {
+    if (!binary || !small || !contour || !hull) {
         ESP_LOGE(TAG, "Failed to allocate processing buffers!");
         goto cleanup;
     }
 
-    // Step 0.5: Blur both images to suppress plywood grain and sensor noise
-    ESP_LOGI(TAG, "Step 0.5: Box blur (radius=%d) to suppress grain...", BLUR_RADIUS);
-    apply_box_blur(grayscale, blurred_cur, width, height, BLUR_RADIUS);
-    apply_box_blur(reference, blurred_ref, width, height, BLUR_RADIUS);
+    // Step 1: Downscale to destroy texture (320x240 → 80x60)
+    ESP_LOGI(TAG, "Step 1: Downscale %dx%d → %dx%d (factor=%d)...",
+             width, height, sm_w, sm_h, DOWNSCALE_FACTOR);
+    downscale(grayscale, width, height, small, sm_w, sm_h, DOWNSCALE_FACTOR);
 
-    // Step 1: Background subtraction on blurred images
-    ESP_LOGI(TAG, "Step 1: Background subtraction (threshold=%d)...", DIFF_THRESHOLD);
-    background_subtract(blurred_cur, blurred_ref, binary, width, height, DIFF_THRESHOLD);
+    // Step 1.5: Apply ROI on small image — only analyze plywood region, not surrounding table
+    int sm_margin_x = sm_w * ROI_MARGIN_PERCENT / 100;
+    int sm_margin_y = sm_h * ROI_MARGIN_PERCENT / 100;
+    ESP_LOGI(TAG, "Step 1.5: ROI on small image (margin %d%%: x=%d, y=%d)...",
+             ROI_MARGIN_PERCENT, sm_margin_x, sm_margin_y);
 
-    heap_caps_free(blurred_cur);
-    heap_caps_free(blurred_ref);
-    blurred_cur = NULL;
-    blurred_ref = NULL;
+    // Compute Otsu only on ROI pixels (center of image = plywood surface)
+    int roi_hist[256] = {0};
+    int roi_count = 0;
+    for (int y = sm_margin_y; y < sm_h - sm_margin_y; y++) {
+        for (int x = sm_margin_x; x < sm_w - sm_margin_x; x++) {
+            roi_hist[small[y * sm_w + x]]++;
+            roi_count++;
+        }
+    }
 
-    // Step 1.5: Morphological opening (erode then dilate) to remove shadows
-    ESP_LOGI(TAG, "Step 1.5: Morphological opening (erode=%d, dilate=%d)...",
-             EROSION_ITERATIONS, DILATION_ITERATIONS);
-    apply_erosion(binary, width, height, EROSION_ITERATIONS);
-    apply_dilation(binary, width, height, DILATION_ITERATIONS);
+    // Otsu on ROI histogram
+    float sum = 0;
+    for (int i = 0; i < 256; i++) sum += (float)i * roi_hist[i];
+    float sumB = 0;
+    int wB = 0, wF = 0;
+    float max_var = 0;
+    int thresh = 128;
+    for (int t = 0; t < 256; t++) {
+        wB += roi_hist[t];
+        if (wB == 0) continue;
+        wF = roi_count - wB;
+        if (wF == 0) break;
+        sumB += (float)t * roi_hist[t];
+        float mB = sumB / wB;
+        float mF = (sum - sumB) / wF;
+        float var = (float)wB * (float)wF * (mB - mF) * (mB - mF);
+        if (var > max_var) {
+            max_var = var;
+            thresh = t;
+        }
+    }
+    ESP_LOGI(TAG, "Step 1.6: Otsu threshold (ROI only) = %d", thresh);
 
-    // Step 1.7: ROI mask — zero out edges near image borders to eliminate surface noise
-    {
-        int margin_x = width * ROI_MARGIN_PERCENT / 100;
-        int margin_y = height * ROI_MARGIN_PERCENT / 100;
-        ESP_LOGI(TAG, "Step 1.7: ROI mask (margin %d%%: x=%d, y=%d)...", ROI_MARGIN_PERCENT, margin_x, margin_y);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                if (x < margin_x || x >= width - margin_x || y < margin_y || y >= height - margin_y) {
-                    binary[y * width + x] = 0;
-                }
+    // Determine polarity: compute average of ROI border ring (should be plywood)
+    int plywood_sum = 0, plywood_count = 0;
+    for (int x = sm_margin_x; x < sm_w - sm_margin_x; x++) {
+        plywood_sum += small[sm_margin_y * sm_w + x];               // ROI top edge
+        plywood_sum += small[(sm_h - sm_margin_y - 1) * sm_w + x];  // ROI bottom edge
+        plywood_count += 2;
+    }
+    for (int y = sm_margin_y + 1; y < sm_h - sm_margin_y - 1; y++) {
+        plywood_sum += small[y * sm_w + sm_margin_x];               // ROI left edge
+        plywood_sum += small[y * sm_w + sm_w - sm_margin_x - 1];    // ROI right edge
+        plywood_count += 2;
+    }
+    int plywood_avg = plywood_sum / plywood_count;
+    bool object_is_dark = (plywood_avg > thresh);
+    ESP_LOGI(TAG, "  Plywood avg=%d, object is %s than plywood",
+             plywood_avg, object_is_dark ? "darker" : "brighter");
+
+    // Binarize: object pixels = 255, plywood = 0
+    for (int i = 0; i < sm_w * sm_h; i++) {
+        if (object_is_dark) {
+            small[i] = (small[i] < thresh) ? 255 : 0;
+        } else {
+            small[i] = (small[i] > thresh) ? 255 : 0;
+        }
+    }
+
+    // Zero out outside ROI on the small binary (table edges)
+    for (int y = 0; y < sm_h; y++) {
+        for (int x = 0; x < sm_w; x++) {
+            if (x < sm_margin_x || x >= sm_w - sm_margin_x ||
+                y < sm_margin_y || y >= sm_h - sm_margin_y) {
+                small[y * sm_w + x] = 0;
             }
         }
     }
+
+    // Step 1.7: Upscale binary mask back to full resolution
+    ESP_LOGI(TAG, "Step 1.7: Upscale mask %dx%d → %dx%d...", sm_w, sm_h, width, height);
+    upscale_mask(small, sm_w, sm_h, binary, width, height, DOWNSCALE_FACTOR);
+
+    heap_caps_free(small);
+    small = NULL;
+
+    // Step 1.8: Morphological cleanup (erode removes noise fringe, dilate restores shape)
+    ESP_LOGI(TAG, "Step 1.8: Morphological cleanup (erode=%d, dilate=%d)...",
+             EROSION_ITERATIONS, DILATION_ITERATIONS);
+    apply_erosion(binary, width, height, EROSION_ITERATIONS);
+    apply_dilation(binary, width, height, DILATION_ITERATIONS);
 
     // Step 2: Trace contours and pick the largest
     int min_bbox_area = (width * height * MIN_BBOX_AREA_PCT) / 100;
@@ -1063,8 +1113,7 @@ static min_area_rect_t process_image(uint8_t *grayscale, uint8_t *reference,
 
 cleanup:
     if (binary) heap_caps_free(binary);
-    if (blurred_cur) heap_caps_free(blurred_cur);
-    if (blurred_ref) heap_caps_free(blurred_ref);
+    if (small) heap_caps_free(small);
     if (contour) heap_caps_free(contour);
     if (hull) heap_caps_free(hull);
 
@@ -1127,34 +1176,6 @@ static esp_err_t init_camera(void)
     return ESP_OK;
 }
 
-static void lock_camera_settings(void)
-{
-    // Let auto-exposure settle by discarding several frames
-    ESP_LOGI(TAG, "Letting camera auto-expose settle...");
-    for (int i = 0; i < 10; i++) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) esp_camera_fb_return(fb);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    sensor_t *s = esp_camera_sensor_get();
-
-    // Read the auto-determined values before locking
-    s->get_reg(s, 0, 0);  // Force status update
-    int cur_aec = s->status.aec_value;
-    int cur_agc = s->status.agc_gain;
-
-    // Now freeze at the auto-determined values
-    s->set_exposure_ctrl(s, 0);    // Disable auto exposure
-    s->set_gain_ctrl(s, 0);        // Disable auto gain
-    s->set_whitebal(s, 0);         // Disable auto white balance
-    s->set_aec2(s, 0);             // Disable AEC DSP
-    s->set_aec_value(s, cur_aec);  // Lock at current exposure
-    s->set_agc_gain(s, cur_agc);   // Lock at current gain
-
-    ESP_LOGI(TAG, "Camera settings locked (aec=%d, agc=%d)", cur_aec, cur_agc);
-}
-
 // ============== MAIN ==============
 
 void app_main(void)
@@ -1174,8 +1195,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Camera required!");
         return;
     }
-    lock_camera_settings();
-
     // Step 0: Connect WiFi and fetch calibration factor from server
     bool wifi_ok = wifi_init();
     if (wifi_ok) {
@@ -1196,29 +1215,6 @@ void app_main(void)
     // Step 1: Read tare on empty plywood
     hx711_init();
     hx711_read_tare();
-
-    // Capture reference image now (surface is empty, right before object placement)
-    ESP_LOGI(TAG, ">>> Capturing reference image (empty surface)...");
-    for (int i = 0; i < 3; i++) {
-        camera_fb_t *discard = esp_camera_fb_get();
-        if (discard) esp_camera_fb_return(discard);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    camera_fb_t *ref_fb = esp_camera_fb_get();
-    if (ref_fb) {
-        g_ref_width = ref_fb->width;
-        g_ref_height = ref_fb->height;
-        g_reference = heap_caps_malloc(g_ref_width * g_ref_height, MALLOC_CAP_SPIRAM);
-        if (g_reference) {
-            memcpy(g_reference, ref_fb->buf, g_ref_width * g_ref_height);
-            ESP_LOGI(TAG, ">>> Reference captured: %dx%d", g_ref_width, g_ref_height);
-        } else {
-            ESP_LOGW(TAG, ">>> Failed to allocate reference buffer!");
-        }
-        esp_camera_fb_return(ref_fb);
-    } else {
-        ESP_LOGW(TAG, ">>> Failed to capture reference image!");
-    }
 
     // Step 2: Place object on the scale (which is under the camera)
     ESP_LOGI(TAG, "");
@@ -1287,10 +1283,7 @@ void app_main(void)
     // Process: find min area rectangle (this modifies img_copy)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Processing image...");
-    if (!g_reference) {
-        ESP_LOGW(TAG, ">>> No reference image — background subtraction may be unreliable!");
-    }
-    min_area_rect_t rect = process_image(img_copy, g_reference, img_width, img_height, g_dynamic_ppmm);
+    min_area_rect_t rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
 
     // Print results
     ESP_LOGI(TAG, "");
