@@ -26,7 +26,7 @@
 #define SERVER_IP       "192.168.0.243"
 #define SERVER_PORT     8080
 #define WIFI_MAX_RETRY  10
-#define HX711_CAL_FACTOR_DEFAULT 29.46f   // raw units per gram (fallback)
+#define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -47,16 +47,15 @@ static int s_retry_num = 0;
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define DOWNSCALE_FACTOR    4       // Downscale NxN to 1 pixel (kills texture, 320x240 → 80x60)
-#define EROSION_ITERATIONS  1       // Morphological cleanup: erode to remove noise fringe
-#define DILATION_ITERATIONS 2       // Morphological cleanup: dilate to restore object shape
+#define SOBEL_THRESHOLD     130     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
+#define DILATION_ITERATIONS 3       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define MAX_CONTOUR_SEARCH  10      // Max contours to evaluate before picking the largest
-#define ROI_MARGIN_PERCENT  15      // Ignore outer N% of image on each side (excludes table around plywood)
+#define ROI_MARGIN_PERCENT  0       // Disabled — white board detection handles ROI
 #define MIN_BBOX_AREA_PCT   2       // Minimum contour bounding box as % of image area (rejects tiny noise)
 #define PIXELS_PER_MM_REF   0.653f  // Calibrated at reference distance (48.1 cm)
-#define CALIBRATION_DIST_CM 48.1f   // Reference distance (cm) for PIXELS_PER_MM_REF
-#define FIXED_BASELINE_CM      48.1f  // Fixed baseline distance (sensor to surface) in cm
+#define CALIBRATION_DIST_CM 153.28f  // Reference distance (cm) for PIXELS_PER_MM_REF
+#define FIXED_BASELINE_CM      153.28f // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
 
 // AI-Thinker ESP32-CAM Pin Mapping
@@ -545,80 +544,48 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
     return success;
 }
 
-// ============== STEP 1: DOWNSCALE + OTSU THRESHOLDING ==============
+// ============== STEP 1: SOBEL EDGE DETECTION ==============
 
-// Downscale image by averaging NxN blocks
-static void downscale(uint8_t *src, int src_w, int src_h,
-                      uint8_t *dst, int dst_w, int dst_h, int factor)
+static void apply_sobel(uint8_t *src, uint8_t *dst, int width, int height, int edge_thresh)
 {
-    int block_area = factor * factor;
-    for (int dy = 0; dy < dst_h; dy++) {
-        for (int dx = 0; dx < dst_w; dx++) {
-            int sum = 0;
-            int sy0 = dy * factor;
-            int sx0 = dx * factor;
-            for (int by = 0; by < factor && (sy0 + by) < src_h; by++) {
-                for (int bx = 0; bx < factor && (sx0 + bx) < src_w; bx++) {
-                    sum += src[(sy0 + by) * src_w + (sx0 + bx)];
-                }
-            }
-            dst[dy * dst_w + dx] = (uint8_t)(sum / block_area);
+    // Sobel kernels:
+    // Gx: [-1, 0, 1]    Gy: [-1, -2, -1]
+    //     [-2, 0, 2]        [ 0,  0,  0]
+    //     [-1, 0, 1]        [ 1,  2,  1]
+
+    // Border pixels: no edge
+    for (int x = 0; x < width; x++) {
+        dst[x] = 0;
+        dst[(height - 1) * width + x] = 0;
+    }
+    for (int y = 0; y < height; y++) {
+        dst[y * width] = 0;
+        dst[y * width + width - 1] = 0;
+    }
+
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            int p00 = src[(y - 1) * width + (x - 1)];
+            int p01 = src[(y - 1) * width +  x];
+            int p02 = src[(y - 1) * width + (x + 1)];
+            int p10 = src[ y      * width + (x - 1)];
+            int p12 = src[ y      * width + (x + 1)];
+            int p20 = src[(y + 1) * width + (x - 1)];
+            int p21 = src[(y + 1) * width +  x];
+            int p22 = src[(y + 1) * width + (x + 1)];
+
+            int gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
+            int gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
+
+            // Manhattan magnitude (avoids sqrt, range 0-2040)
+            int mag = abs(gx) + abs(gy);
+            dst[y * width + x] = (mag > edge_thresh) ? 255 : 0;
         }
     }
 }
 
-// Upscale binary mask by replicating each pixel into NxN block
-static void upscale_mask(uint8_t *small, int sm_w, int sm_h,
-                         uint8_t *big, int big_w, int big_h, int factor)
-{
-    for (int sy = 0; sy < sm_h; sy++) {
-        for (int sx = 0; sx < sm_w; sx++) {
-            uint8_t val = small[sy * sm_w + sx];
-            int by0 = sy * factor;
-            int bx0 = sx * factor;
-            for (int by = 0; by < factor && (by0 + by) < big_h; by++) {
-                for (int bx = 0; bx < factor && (bx0 + bx) < big_w; bx++) {
-                    big[(by0 + by) * big_w + (bx0 + bx)] = val;
-                }
-            }
-        }
-    }
-}
-
-// Otsu's method: find optimal threshold that maximizes inter-class variance
-static int otsu_threshold(uint8_t *img, int size)
-{
-    int hist[256] = {0};
-    for (int i = 0; i < size; i++) hist[img[i]]++;
-
-    float sum = 0;
-    for (int i = 0; i < 256; i++) sum += (float)i * hist[i];
-
-    float sumB = 0;
-    int wB = 0, wF = 0;
-    float max_var = 0;
-    int threshold = 128;
-
-    for (int t = 0; t < 256; t++) {
-        wB += hist[t];
-        if (wB == 0) continue;
-        wF = size - wB;
-        if (wF == 0) break;
-
-        sumB += (float)t * hist[t];
-        float mB = sumB / wB;
-        float mF = (sum - sumB) / wF;
-        float var = (float)wB * (float)wF * (mB - mF) * (mB - mF);
-
-        if (var > max_var) {
-            max_var = var;
-            threshold = t;
-        }
-    }
-    return threshold;
-}
-
-// ============== MORPHOLOGICAL OPERATIONS ==============
+// ============== STEP 1.5: DILATION (Close edge gaps) ==============
+// Dilation expands edge pixels - closes small gaps so contour tracer can follow
 
 static void apply_dilation(uint8_t *img, int width, int height, int iterations)
 {
@@ -645,33 +612,6 @@ static void apply_dilation(uint8_t *img, int width, int height, int iterations)
         }
     }
 
-    heap_caps_free(temp);
-}
-
-// ============== STEP 1: EROSION (for morphological opening) ==============
-
-static void apply_erosion(uint8_t *img, int width, int height, int iterations)
-{
-    uint8_t *temp = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM);
-    if (!temp) return;
-
-    for (int iter = 0; iter < iterations; iter++) {
-        memcpy(temp, img, width * height);
-        for (int y = 1; y < height - 1; y++) {
-            for (int x = 1; x < width - 1; x++) {
-                bool all_white = true;
-                for (int dy = -1; dy <= 1 && all_white; dy++) {
-                    for (int dx = -1; dx <= 1; dx++) {
-                        if (temp[(y + dy) * width + (x + dx)] == 0) {
-                            all_white = false;
-                            break;
-                        }
-                    }
-                }
-                img[y * width + x] = all_white ? 255 : 0;
-            }
-        }
-    }
     heap_caps_free(temp);
 }
 
@@ -916,117 +856,220 @@ static void draw_min_area_rect(uint8_t *img, int width, int height, min_area_rec
     }
 }
 
+// ============== STEP 0: WHITE BOARD DETECTION ==============
+
+// Otsu's method: find threshold that minimizes intra-class variance
+static int otsu_threshold(uint8_t *img, int size)
+{
+    int hist[256] = {0};
+    for (int i = 0; i < size; i++) {
+        hist[img[i]]++;
+    }
+
+    int total = size;
+    int sum = 0;
+    for (int i = 0; i < 256; i++) sum += i * hist[i];
+
+    int sum_bg = 0;
+    int weight_bg = 0;
+    float max_var = 0;
+    int best_t = 0;
+
+    for (int t = 0; t < 256; t++) {
+        weight_bg += hist[t];
+        if (weight_bg == 0) continue;
+        int weight_fg = total - weight_bg;
+        if (weight_fg == 0) break;
+
+        sum_bg += t * hist[t];
+        float mean_bg = (float)sum_bg / weight_bg;
+        float mean_fg = (float)(sum - sum_bg) / weight_fg;
+        float diff = mean_bg - mean_fg;
+        float var = (float)weight_bg * weight_fg * diff * diff;
+        if (var > max_var) {
+            max_var = var;
+            best_t = t;
+        }
+    }
+    return best_t;
+}
+
+// Find the white board bounding box by downscaling, Otsu thresholding, and bbox of bright pixels
+static bool find_white_board(uint8_t *img, int width, int height,
+                             int *out_x0, int *out_y0, int *out_x1, int *out_y1)
+{
+    // Downscale 4x to kill noise
+    int sw = width / 4;
+    int sh = height / 4;
+    uint8_t *small = heap_caps_malloc(sw * sh, MALLOC_CAP_SPIRAM);
+    if (!small) return false;
+
+    for (int sy = 0; sy < sh; sy++) {
+        for (int sx = 0; sx < sw; sx++) {
+            // Average 4x4 block
+            int sum = 0;
+            for (int dy = 0; dy < 4; dy++) {
+                for (int dx = 0; dx < 4; dx++) {
+                    sum += img[(sy * 4 + dy) * width + (sx * 4 + dx)];
+                }
+            }
+            small[sy * sw + sx] = sum / 16;
+        }
+    }
+
+    int thresh = otsu_threshold(small, sw * sh);
+    ESP_LOGI(TAG, "  Otsu threshold (on %dx%d): %d", sw, sh, thresh);
+
+    // Binarize: bright = white board candidate, dark = table
+    for (int i = 0; i < sw * sh; i++) {
+        small[i] = (small[i] > thresh) ? 255 : 0;
+    }
+
+    // Erode 2x to break thin bridges (clips/wires touching the board edge)
+    uint8_t *tmp = heap_caps_malloc(sw * sh, MALLOC_CAP_SPIRAM);
+    if (tmp) {
+        for (int iter = 0; iter < 2; iter++) {
+            memcpy(tmp, small, sw * sh);
+            for (int sy = 1; sy < sh - 1; sy++) {
+                for (int sx = 1; sx < sw - 1; sx++) {
+                    if (tmp[sy * sw + sx] == 0 ||
+                        tmp[(sy-1) * sw + sx] == 0 || tmp[(sy+1) * sw + sx] == 0 ||
+                        tmp[sy * sw + (sx-1)] == 0 || tmp[sy * sw + (sx+1)] == 0) {
+                        small[sy * sw + sx] = 0;
+                    }
+                }
+            }
+        }
+        heap_caps_free(tmp);
+    }
+
+    // Flood-fill to find the largest connected bright region (= the white board)
+    uint8_t *labels = heap_caps_calloc(sw * sh, 1, MALLOC_CAP_SPIRAM);
+    if (!labels) { heap_caps_free(small); return false; }
+
+    int best_label = 0, best_count = 0;
+    int cur_label = 0;
+
+    // Simple two-pass: flood fill each unvisited bright pixel, track the biggest
+    for (int sy = 0; sy < sh; sy++) {
+        for (int sx = 0; sx < sw; sx++) {
+            if (small[sy * sw + sx] == 255 && labels[sy * sw + sx] == 0) {
+                cur_label++;
+                int count = 0;
+                // BFS flood fill using small[] as visited marker
+                // Use labels array to store component ID
+                // Simple stack-based fill using the end of labels buffer as stack
+                int stack_cap = sw * sh / 2;
+                int16_t *stack = (int16_t *)heap_caps_malloc(stack_cap * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+                if (!stack) continue;
+                int sp = 0;
+                stack[sp * 2] = sx; stack[sp * 2 + 1] = sy; sp++;
+                labels[sy * sw + sx] = cur_label;
+                while (sp > 0) {
+                    sp--;
+                    int cx = stack[sp * 2], cy = stack[sp * 2 + 1];
+                    count++;
+                    // 4-connected neighbors
+                    int nx_arr[] = {cx - 1, cx + 1, cx, cx};
+                    int ny_arr[] = {cy, cy, cy - 1, cy + 1};
+                    for (int d = 0; d < 4; d++) {
+                        int nx = nx_arr[d], ny = ny_arr[d];
+                        if (nx >= 0 && nx < sw && ny >= 0 && ny < sh &&
+                            small[ny * sw + nx] == 255 && labels[ny * sw + nx] == 0) {
+                            labels[ny * sw + nx] = cur_label;
+                            if (sp < stack_cap) {
+                                stack[sp * 2] = nx; stack[sp * 2 + 1] = ny; sp++;
+                            }
+                        }
+                    }
+                }
+                heap_caps_free(stack);
+                if (count > best_count) {
+                    best_count = count;
+                    best_label = cur_label;
+                }
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "  Largest bright region: %d pixels (label %d of %d)", best_count, best_label, cur_label);
+
+    // Bounding box of the largest bright region only
+    int min_x = sw, min_y = sh, max_x = -1, max_y = -1;
+    for (int sy = 0; sy < sh; sy++) {
+        for (int sx = 0; sx < sw; sx++) {
+            if (labels[sy * sw + sx] == best_label) {
+                if (sx < min_x) min_x = sx;
+                if (sx > max_x) max_x = sx;
+                if (sy < min_y) min_y = sy;
+                if (sy > max_y) max_y = sy;
+            }
+        }
+    }
+
+    heap_caps_free(labels);
+    heap_caps_free(small);
+
+    if (max_x < 0) return false;  // No bright pixels found
+
+    // Scale back to full resolution and add padding
+    int pad = 5;
+    *out_x0 = min_x * 4 - pad;
+    *out_y0 = min_y * 4 - pad;
+    *out_x1 = (max_x + 1) * 4 + pad;
+    *out_y1 = (max_y + 1) * 4 + pad;
+
+    // Clamp to image bounds
+    if (*out_x0 < 0) *out_x0 = 0;
+    if (*out_y0 < 0) *out_y0 = 0;
+    if (*out_x1 > width) *out_x1 = width;
+    if (*out_y1 > height) *out_y1 = height;
+
+    return true;
+}
+
 // ============== MAIN PROCESSING FUNCTION ==============
 
 static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, float pixels_per_mm)
 {
     min_area_rect_t result = {0};
 
-    int sm_w = width / DOWNSCALE_FACTOR;
-    int sm_h = height / DOWNSCALE_FACTOR;
-
     // Allocate buffers in PSRAM
     uint8_t *binary = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *small = heap_caps_malloc(sm_w * sm_h, MALLOC_CAP_SPIRAM);
     point_t *contour = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
     point_t *hull = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
 
-    if (!binary || !small || !contour || !hull) {
+    if (!binary || !contour || !hull) {
         ESP_LOGE(TAG, "Failed to allocate processing buffers!");
         goto cleanup;
     }
 
-    // Step 1: Downscale to destroy texture (320x240 → 80x60)
-    ESP_LOGI(TAG, "Step 1: Downscale %dx%d → %dx%d (factor=%d)...",
-             width, height, sm_w, sm_h, DOWNSCALE_FACTOR);
-    downscale(grayscale, width, height, small, sm_w, sm_h, DOWNSCALE_FACTOR);
-
-    // Step 1.5: Apply ROI on small image — only analyze plywood region, not surrounding table
-    int sm_margin_x = sm_w * ROI_MARGIN_PERCENT / 100;
-    int sm_margin_y = sm_h * ROI_MARGIN_PERCENT / 100;
-    ESP_LOGI(TAG, "Step 1.5: ROI on small image (margin %d%%: x=%d, y=%d)...",
-             ROI_MARGIN_PERCENT, sm_margin_x, sm_margin_y);
-
-    // Compute Otsu only on ROI pixels (center of image = plywood surface)
-    int roi_hist[256] = {0};
-    int roi_count = 0;
-    for (int y = sm_margin_y; y < sm_h - sm_margin_y; y++) {
-        for (int x = sm_margin_x; x < sm_w - sm_margin_x; x++) {
-            roi_hist[small[y * sm_w + x]]++;
-            roi_count++;
-        }
-    }
-
-    // Otsu on ROI histogram
-    float sum = 0;
-    for (int i = 0; i < 256; i++) sum += (float)i * roi_hist[i];
-    float sumB = 0;
-    int wB = 0, wF = 0;
-    float max_var = 0;
-    int thresh = 128;
-    for (int t = 0; t < 256; t++) {
-        wB += roi_hist[t];
-        if (wB == 0) continue;
-        wF = roi_count - wB;
-        if (wF == 0) break;
-        sumB += (float)t * roi_hist[t];
-        float mB = sumB / wB;
-        float mF = (sum - sumB) / wF;
-        float var = (float)wB * (float)wF * (mB - mF) * (mB - mF);
-        if (var > max_var) {
-            max_var = var;
-            thresh = t;
-        }
-    }
-    ESP_LOGI(TAG, "Step 1.6: Otsu threshold (ROI only) = %d", thresh);
-
-    // Determine polarity: compute average of ROI border ring (should be plywood)
-    int plywood_sum = 0, plywood_count = 0;
-    for (int x = sm_margin_x; x < sm_w - sm_margin_x; x++) {
-        plywood_sum += small[sm_margin_y * sm_w + x];               // ROI top edge
-        plywood_sum += small[(sm_h - sm_margin_y - 1) * sm_w + x];  // ROI bottom edge
-        plywood_count += 2;
-    }
-    for (int y = sm_margin_y + 1; y < sm_h - sm_margin_y - 1; y++) {
-        plywood_sum += small[y * sm_w + sm_margin_x];               // ROI left edge
-        plywood_sum += small[y * sm_w + sm_w - sm_margin_x - 1];    // ROI right edge
-        plywood_count += 2;
-    }
-    int plywood_avg = plywood_sum / plywood_count;
-    bool object_is_dark = (plywood_avg > thresh);
-    ESP_LOGI(TAG, "  Plywood avg=%d, object is %s than plywood",
-             plywood_avg, object_is_dark ? "darker" : "brighter");
-
-    // Binarize: object pixels = 255, plywood = 0
-    for (int i = 0; i < sm_w * sm_h; i++) {
-        if (object_is_dark) {
-            small[i] = (small[i] < thresh) ? 255 : 0;
-        } else {
-            small[i] = (small[i] > thresh) ? 255 : 0;
-        }
-    }
-
-    // Zero out outside ROI on the small binary (table edges)
-    for (int y = 0; y < sm_h; y++) {
-        for (int x = 0; x < sm_w; x++) {
-            if (x < sm_margin_x || x >= sm_w - sm_margin_x ||
-                y < sm_margin_y || y >= sm_h - sm_margin_y) {
-                small[y * sm_w + x] = 0;
+    // Step 0: Find white board region and mask everything outside it
+    {
+        int wb_x0, wb_y0, wb_x1, wb_y1;
+        ESP_LOGI(TAG, "Step 0: Finding white board region...");
+        if (find_white_board(grayscale, width, height, &wb_x0, &wb_y0, &wb_x1, &wb_y1)) {
+            ESP_LOGI(TAG, "Step 0: White board found at (%d,%d)-(%d,%d) [%dx%d]",
+                     wb_x0, wb_y0, wb_x1, wb_y1, wb_x1 - wb_x0, wb_y1 - wb_y0);
+            // Zero out all pixels outside the white board bbox
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    if (x < wb_x0 || x >= wb_x1 || y < wb_y0 || y >= wb_y1) {
+                        grayscale[y * width + x] = 0;
+                    }
+                }
             }
+        } else {
+            ESP_LOGW(TAG, "Step 0: White board not found — using full image");
         }
     }
 
-    // Step 1.7: Upscale binary mask back to full resolution
-    ESP_LOGI(TAG, "Step 1.7: Upscale mask %dx%d → %dx%d...", sm_w, sm_h, width, height);
-    upscale_mask(small, sm_w, sm_h, binary, width, height, DOWNSCALE_FACTOR);
+    // Step 1: Sobel edge detection
+    ESP_LOGI(TAG, "Step 1: Sobel edge detection (threshold=%d)...", SOBEL_THRESHOLD);
+    apply_sobel(grayscale, binary, width, height, SOBEL_THRESHOLD);
 
-    heap_caps_free(small);
-    small = NULL;
-
-    // Step 1.8: Morphological cleanup (erode removes noise fringe, dilate restores shape)
-    ESP_LOGI(TAG, "Step 1.8: Morphological cleanup (erode=%d, dilate=%d)...",
-             EROSION_ITERATIONS, DILATION_ITERATIONS);
-    apply_erosion(binary, width, height, EROSION_ITERATIONS);
+    // Step 1.5: Dilation to close edge gaps
+    ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
     apply_dilation(binary, width, height, DILATION_ITERATIONS);
 
     // Step 2: Trace contours and pick the largest
@@ -1113,7 +1156,6 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
 
 cleanup:
     if (binary) heap_caps_free(binary);
-    if (small) heap_caps_free(small);
     if (contour) heap_caps_free(contour);
     if (hull) heap_caps_free(hull);
 
@@ -1195,6 +1237,15 @@ void app_main(void)
         ESP_LOGE(TAG, "Camera required!");
         return;
     }
+
+    // Let auto-exposure settle by discarding frames
+    ESP_LOGI(TAG, "Camera warming up (auto-exposure)...");
+    for (int i = 0; i < 15; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     // Step 0: Connect WiFi and fetch calibration factor from server
     bool wifi_ok = wifi_init();
     if (wifi_ok) {
@@ -1216,11 +1267,12 @@ void app_main(void)
     hx711_init();
     hx711_read_tare();
 
-    // Step 2: Place object on the scale (which is under the camera)
+    // Step 2: Place object on load cell and weigh
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Place object on the scale... (5 seconds)");
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(TAG, ">>> Settling... (3 seconds)");
+    // Discard a few readings while load cell settles
     for (int i = 0; i < 5; i++) {
         hx711_read_raw();
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -1229,7 +1281,12 @@ void app_main(void)
     float weight_g = hx711_read_grams();
     ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
 
-    // Step 3: Ultrasonic reading (object is on surface)
+    // Step 3: Place object under camera
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, ">>> Now place object under camera... (5 seconds)");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Step 3.5: Second ultrasonic reading (with object)
     ESP_LOGI(TAG, ">>> Measuring object distance...");
     g_object_cm = ultrasonic_measure();
     ESP_LOGI(TAG, ">>> Ultrasonic raw reading: %.2f cm (baseline=%.2f cm)", g_object_cm, g_baseline_cm);
@@ -1246,8 +1303,7 @@ void app_main(void)
         g_dynamic_ppmm = PIXELS_PER_MM_REF;
     }
 
-    // Step 4: Capture image (object is on the surface)
-    // Discard stale frames — buffer has been holding an old frame since reference capture
+    // Step 4: Capture image — flush stale frames first
     ESP_LOGI(TAG, ">>> Flushing stale camera frames...");
     for (int i = 0; i < 5; i++) {
         camera_fb_t *discard = esp_camera_fb_get();
@@ -1255,7 +1311,7 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    ESP_LOGI(TAG, ">>> Capturing fresh image (with object)...");
+    ESP_LOGI(TAG, ">>> Capturing image...");
     camera_fb_t *fb = esp_camera_fb_get();
 
     if (!fb) {
@@ -1336,6 +1392,8 @@ void app_main(void)
         // Wait for reconnection
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                             pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+        // Let connection stabilize before uploading
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
     // Upload result image via WiFi
