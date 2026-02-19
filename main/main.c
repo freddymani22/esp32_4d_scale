@@ -63,7 +63,7 @@ static const char *TAG = "measure";
 // Set to 1 to upload raw image without processing (for finding board coordinates)
 // Set back to 0 for normal operation
 #define RAW_CAPTURE_MODE  0
-#define PIXELS_PER_MM_REF   0.2225f // Calibrated at 153.28 cm with 140x140mm object
+#define PIXELS_PER_MM_REF   0.1644f // Calibrated at 153.28 cm with 160x110mm and 210x140mm objects
 #define CALIBRATION_DIST_CM 153.28f  // Reference distance (cm) for PIXELS_PER_MM_REF
 #define FIXED_BASELINE_CM      153.28f // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
