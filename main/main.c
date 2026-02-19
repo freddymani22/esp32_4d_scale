@@ -47,13 +47,23 @@ static int s_retry_num = 0;
 static const char *TAG = "measure";
 
 // ============== CONFIGURATION ==============
-#define SOBEL_THRESHOLD     130     // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
-#define DILATION_ITERATIONS 3       // Close edge gaps after Sobel (increase if contour has breaks)
+#define SOBEL_THRESHOLD     60      // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
+#define DILATION_ITERATIONS 1       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define MAX_CONTOUR_SEARCH  10      // Max contours to evaluate before picking the largest
-#define ROI_MARGIN_PERCENT  0       // Disabled — white board detection handles ROI
 #define MIN_BBOX_AREA_PCT   2       // Minimum contour bounding box as % of image area (rejects tiny noise)
-#define PIXELS_PER_MM_REF   0.653f  // Calibrated at reference distance (48.1 cm)
+
+// Hardcoded white board crop region (pixels) — measured from full 320x240 image at fixed 153.28cm
+// Adjust these if the camera position changes
+#define BOARD_X0  50
+#define BOARD_Y0  18
+#define BOARD_X1  195
+#define BOARD_Y1  160
+
+// Set to 1 to upload raw image without processing (for finding board coordinates)
+// Set back to 0 for normal operation
+#define RAW_CAPTURE_MODE  0
+#define PIXELS_PER_MM_REF   0.2225f // Calibrated at 153.28 cm with 140x140mm object
 #define CALIBRATION_DIST_CM 153.28f  // Reference distance (cm) for PIXELS_PER_MM_REF
 #define FIXED_BASELINE_CM      153.28f // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
@@ -172,7 +182,7 @@ static void hx711_init(void)
 
 static int32_t hx711_tare = 0;
 
-#define HX711_NUM_READINGS 10
+#define HX711_NUM_READINGS 5
 
 static int cmp_int32(const void *a, const void *b)
 {
@@ -856,177 +866,6 @@ static void draw_min_area_rect(uint8_t *img, int width, int height, min_area_rec
     }
 }
 
-// ============== STEP 0: WHITE BOARD DETECTION ==============
-
-// Otsu's method: find threshold that minimizes intra-class variance
-static int otsu_threshold(uint8_t *img, int size)
-{
-    int hist[256] = {0};
-    for (int i = 0; i < size; i++) {
-        hist[img[i]]++;
-    }
-
-    int total = size;
-    int sum = 0;
-    for (int i = 0; i < 256; i++) sum += i * hist[i];
-
-    int sum_bg = 0;
-    int weight_bg = 0;
-    float max_var = 0;
-    int best_t = 0;
-
-    for (int t = 0; t < 256; t++) {
-        weight_bg += hist[t];
-        if (weight_bg == 0) continue;
-        int weight_fg = total - weight_bg;
-        if (weight_fg == 0) break;
-
-        sum_bg += t * hist[t];
-        float mean_bg = (float)sum_bg / weight_bg;
-        float mean_fg = (float)(sum - sum_bg) / weight_fg;
-        float diff = mean_bg - mean_fg;
-        float var = (float)weight_bg * weight_fg * diff * diff;
-        if (var > max_var) {
-            max_var = var;
-            best_t = t;
-        }
-    }
-    return best_t;
-}
-
-// Find the white board bounding box by downscaling, Otsu thresholding, and bbox of bright pixels
-static bool find_white_board(uint8_t *img, int width, int height,
-                             int *out_x0, int *out_y0, int *out_x1, int *out_y1)
-{
-    // Downscale 4x to kill noise
-    int sw = width / 4;
-    int sh = height / 4;
-    uint8_t *small = heap_caps_malloc(sw * sh, MALLOC_CAP_SPIRAM);
-    if (!small) return false;
-
-    for (int sy = 0; sy < sh; sy++) {
-        for (int sx = 0; sx < sw; sx++) {
-            // Average 4x4 block
-            int sum = 0;
-            for (int dy = 0; dy < 4; dy++) {
-                for (int dx = 0; dx < 4; dx++) {
-                    sum += img[(sy * 4 + dy) * width + (sx * 4 + dx)];
-                }
-            }
-            small[sy * sw + sx] = sum / 16;
-        }
-    }
-
-    int thresh = otsu_threshold(small, sw * sh);
-    ESP_LOGI(TAG, "  Otsu threshold (on %dx%d): %d", sw, sh, thresh);
-
-    // Binarize: bright = white board candidate, dark = table
-    for (int i = 0; i < sw * sh; i++) {
-        small[i] = (small[i] > thresh) ? 255 : 0;
-    }
-
-    // Erode 2x to break thin bridges (clips/wires touching the board edge)
-    uint8_t *tmp = heap_caps_malloc(sw * sh, MALLOC_CAP_SPIRAM);
-    if (tmp) {
-        for (int iter = 0; iter < 2; iter++) {
-            memcpy(tmp, small, sw * sh);
-            for (int sy = 1; sy < sh - 1; sy++) {
-                for (int sx = 1; sx < sw - 1; sx++) {
-                    if (tmp[sy * sw + sx] == 0 ||
-                        tmp[(sy-1) * sw + sx] == 0 || tmp[(sy+1) * sw + sx] == 0 ||
-                        tmp[sy * sw + (sx-1)] == 0 || tmp[sy * sw + (sx+1)] == 0) {
-                        small[sy * sw + sx] = 0;
-                    }
-                }
-            }
-        }
-        heap_caps_free(tmp);
-    }
-
-    // Flood-fill to find the largest connected bright region (= the white board)
-    uint8_t *labels = heap_caps_calloc(sw * sh, 1, MALLOC_CAP_SPIRAM);
-    if (!labels) { heap_caps_free(small); return false; }
-
-    int best_label = 0, best_count = 0;
-    int cur_label = 0;
-
-    // Simple two-pass: flood fill each unvisited bright pixel, track the biggest
-    for (int sy = 0; sy < sh; sy++) {
-        for (int sx = 0; sx < sw; sx++) {
-            if (small[sy * sw + sx] == 255 && labels[sy * sw + sx] == 0) {
-                cur_label++;
-                int count = 0;
-                // BFS flood fill using small[] as visited marker
-                // Use labels array to store component ID
-                // Simple stack-based fill using the end of labels buffer as stack
-                int stack_cap = sw * sh / 2;
-                int16_t *stack = (int16_t *)heap_caps_malloc(stack_cap * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-                if (!stack) continue;
-                int sp = 0;
-                stack[sp * 2] = sx; stack[sp * 2 + 1] = sy; sp++;
-                labels[sy * sw + sx] = cur_label;
-                while (sp > 0) {
-                    sp--;
-                    int cx = stack[sp * 2], cy = stack[sp * 2 + 1];
-                    count++;
-                    // 4-connected neighbors
-                    int nx_arr[] = {cx - 1, cx + 1, cx, cx};
-                    int ny_arr[] = {cy, cy, cy - 1, cy + 1};
-                    for (int d = 0; d < 4; d++) {
-                        int nx = nx_arr[d], ny = ny_arr[d];
-                        if (nx >= 0 && nx < sw && ny >= 0 && ny < sh &&
-                            small[ny * sw + nx] == 255 && labels[ny * sw + nx] == 0) {
-                            labels[ny * sw + nx] = cur_label;
-                            if (sp < stack_cap) {
-                                stack[sp * 2] = nx; stack[sp * 2 + 1] = ny; sp++;
-                            }
-                        }
-                    }
-                }
-                heap_caps_free(stack);
-                if (count > best_count) {
-                    best_count = count;
-                    best_label = cur_label;
-                }
-            }
-        }
-    }
-
-    ESP_LOGI(TAG, "  Largest bright region: %d pixels (label %d of %d)", best_count, best_label, cur_label);
-
-    // Bounding box of the largest bright region only
-    int min_x = sw, min_y = sh, max_x = -1, max_y = -1;
-    for (int sy = 0; sy < sh; sy++) {
-        for (int sx = 0; sx < sw; sx++) {
-            if (labels[sy * sw + sx] == best_label) {
-                if (sx < min_x) min_x = sx;
-                if (sx > max_x) max_x = sx;
-                if (sy < min_y) min_y = sy;
-                if (sy > max_y) max_y = sy;
-            }
-        }
-    }
-
-    heap_caps_free(labels);
-    heap_caps_free(small);
-
-    if (max_x < 0) return false;  // No bright pixels found
-
-    // Scale back to full resolution and add padding
-    int pad = 5;
-    *out_x0 = min_x * 4 - pad;
-    *out_y0 = min_y * 4 - pad;
-    *out_x1 = (max_x + 1) * 4 + pad;
-    *out_y1 = (max_y + 1) * 4 + pad;
-
-    // Clamp to image bounds
-    if (*out_x0 < 0) *out_x0 = 0;
-    if (*out_y0 < 0) *out_y0 = 0;
-    if (*out_x1 > width) *out_x1 = width;
-    if (*out_y1 > height) *out_y1 = height;
-
-    return true;
-}
 
 // ============== MAIN PROCESSING FUNCTION ==============
 
@@ -1034,53 +873,48 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
 {
     min_area_rect_t result = {0};
 
-    // Allocate buffers in PSRAM
-    uint8_t *binary = heap_caps_malloc(width * height, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // Step 0: Crop to hardcoded white board region
+    int wb_x0 = BOARD_X0, wb_y0 = BOARD_Y0;
+    int wb_x1 = BOARD_X1, wb_y1 = BOARD_Y1;
+    ESP_LOGI(TAG, "Step 0: Board crop (%d,%d)-(%d,%d) [%dx%d]",
+             wb_x0, wb_y0, wb_x1, wb_y1, wb_x1 - wb_x0, wb_y1 - wb_y0);
+
+    // Crop the white board region into a new buffer
+    int cw = wb_x1 - wb_x0;
+    int ch = wb_y1 - wb_y0;
+    uint8_t *crop = heap_caps_malloc(cw * ch, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *binary = heap_caps_malloc(cw * ch, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     point_t *contour = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
     point_t *hull = heap_caps_malloc(MAX_CONTOUR_POINTS * sizeof(point_t), MALLOC_CAP_SPIRAM);
 
-    if (!binary || !contour || !hull) {
+    if (!crop || !binary || !contour || !hull) {
         ESP_LOGE(TAG, "Failed to allocate processing buffers!");
         goto cleanup;
     }
 
-    // Step 0: Find white board region and mask everything outside it
-    {
-        int wb_x0, wb_y0, wb_x1, wb_y1;
-        ESP_LOGI(TAG, "Step 0: Finding white board region...");
-        if (find_white_board(grayscale, width, height, &wb_x0, &wb_y0, &wb_x1, &wb_y1)) {
-            ESP_LOGI(TAG, "Step 0: White board found at (%d,%d)-(%d,%d) [%dx%d]",
-                     wb_x0, wb_y0, wb_x1, wb_y1, wb_x1 - wb_x0, wb_y1 - wb_y0);
-            // Zero out all pixels outside the white board bbox
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    if (x < wb_x0 || x >= wb_x1 || y < wb_y0 || y >= wb_y1) {
-                        grayscale[y * width + x] = 0;
-                    }
-                }
-            }
-        } else {
-            ESP_LOGW(TAG, "Step 0: White board not found — using full image");
-        }
+    // Copy cropped region
+    for (int y = 0; y < ch; y++) {
+        memcpy(&crop[y * cw], &grayscale[(wb_y0 + y) * width + wb_x0], cw);
     }
 
-    // Step 1: Sobel edge detection
-    ESP_LOGI(TAG, "Step 1: Sobel edge detection (threshold=%d)...", SOBEL_THRESHOLD);
-    apply_sobel(grayscale, binary, width, height, SOBEL_THRESHOLD);
+    // Step 1: Sobel edge detection on cropped image
+    ESP_LOGI(TAG, "Step 1: Sobel edge detection on crop %dx%d (threshold=%d)...", cw, ch, SOBEL_THRESHOLD);
+    apply_sobel(crop, binary, cw, ch, SOBEL_THRESHOLD);
 
     // Step 1.5: Dilation to close edge gaps
     ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
-    apply_dilation(binary, width, height, DILATION_ITERATIONS);
+    apply_dilation(binary, cw, ch, DILATION_ITERATIONS);
 
     // Step 2: Trace contours and pick the largest
-    int min_bbox_area = (width * height * MIN_BBOX_AREA_PCT) / 100;
+    int min_bbox_area = (cw * ch * MIN_BBOX_AREA_PCT) / 100;
+    int max_bbox_area = cw * ch * 80 / 100;  // Skip contours covering >80% of crop (board boundary)
     ESP_LOGI(TAG, "Step 2: Tracing contours (up to %d, min_area=%d)...", MAX_CONTOUR_SEARCH, min_bbox_area);
     int best_contour_count = 0;
     int best_area = 0;
     int best_attempt = -1;
 
     for (int attempt = 0; attempt < MAX_CONTOUR_SEARCH; attempt++) {
-        int contour_count = trace_contour(binary, width, height, contour, MAX_CONTOUR_POINTS);
+        int contour_count = trace_contour(binary, cw, ch, contour, MAX_CONTOUR_POINTS);
         if (contour_count < 3) {
             ESP_LOGI(TAG, "Contour search: attempt %d, %d points — stopping", attempt, contour_count);
             break;
@@ -1099,9 +933,8 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
         ESP_LOGI(TAG, "Contour search: attempt %d, %d points, bbox_area=%d%s", attempt, contour_count, bbox_area,
                  bbox_area < min_bbox_area ? " (too small, skipped)" : "");
 
-        // Skip contours that are too small (noise)
-        if (bbox_area < min_bbox_area) {
-            // Still erase it so we don't re-trace it
+        // Skip contours that are too small (noise) or too large (board boundary)
+        if (bbox_area < min_bbox_area || bbox_area > max_bbox_area) {
             goto erase_contour;
         }
 
@@ -1113,7 +946,6 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
             memcpy(hull, contour, contour_count * sizeof(point_t));
         }
 
-        // Erase this contour from the binary image (3x3 neighborhood) so next iteration finds a different one
         erase_contour:
         for (int i = 0; i < contour_count; i++) {
             int cx = contour[i].x;
@@ -1122,8 +954,8 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
                 for (int dx = -1; dx <= 1; dx++) {
                     int nx = cx + dx;
                     int ny = cy + dy;
-                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                        binary[ny * width + nx] = 0;
+                    if (nx >= 0 && nx < cw && ny >= 0 && ny < ch) {
+                        binary[ny * cw + nx] = 0;
                     }
                 }
             }
@@ -1135,9 +967,12 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
         goto cleanup;
     }
 
-    // Copy best contour from hull back into contour
+    // Copy best contour from hull back into contour, translate to full-image coordinates
     ESP_LOGI(TAG, "Best contour: %d points (attempt %d, bbox_area=%d)", best_contour_count, best_attempt, best_area);
-    memcpy(contour, hull, best_contour_count * sizeof(point_t));
+    for (int i = 0; i < best_contour_count; i++) {
+        contour[i].x = hull[i].x + wb_x0;
+        contour[i].y = hull[i].y + wb_y0;
+    }
     int contour_count = best_contour_count;
 
     // Step 3: Convex hull
@@ -1149,12 +984,22 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
     ESP_LOGI(TAG, "Step 4: Finding minimum area rectangle...");
     result = find_min_area_rect(hull, hull_count, pixels_per_mm);
 
+    // Mask grayscale outside white board for visualization
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            if (x < wb_x0 || x >= wb_x1 || y < wb_y0 || y >= wb_y1) {
+                grayscale[y * width + x] = 0;
+            }
+        }
+    }
+
     // Draw result on original image
     if (result.valid) {
         draw_min_area_rect(grayscale, width, height, &result);
     }
 
 cleanup:
+    if (crop) heap_caps_free(crop);
     if (binary) heap_caps_free(binary);
     if (contour) heap_caps_free(contour);
     if (hull) heap_caps_free(hull);
@@ -1246,47 +1091,21 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    // Step 0: Connect WiFi and fetch calibration factor from server
-    bool wifi_ok = wifi_init();
-    if (wifi_ok) {
-        fetch_cal_factor();
-    }
-
-    // Measure actual distance for reference, but use fixed baseline
-    ultrasonic_init();
-    float measured_baseline = ultrasonic_measure();
-    ESP_LOGI(TAG, ">>> Measured distance (no object): %.2f cm", measured_baseline);
-    g_baseline_cm = FIXED_BASELINE_CM;
-    ESP_LOGI(TAG, ">>> Using fixed baseline: %.2f cm", g_baseline_cm);
-
-    // Stop WiFi during HX711 readings — RF noise interferes with the 24-bit ADC
-    ESP_LOGI(TAG, "Stopping WiFi for clean HX711 readings...");
-    esp_wifi_stop();
-
-    // Step 1: Read tare on empty plywood
+    // Step 1: Read tare on empty board (no WiFi = clean ADC readings)
     hx711_init();
     hx711_read_tare();
 
-    // Step 2: Place object on load cell and weigh
+    // Step 2: Place object on the board and weigh
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> Place object on the scale... (5 seconds)");
+    ESP_LOGI(TAG, ">>> Place object on the board... (5 seconds)");
     vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, ">>> Settling... (3 seconds)");
-    // Discard a few readings while load cell settles
-    for (int i = 0; i < 5; i++) {
-        hx711_read_raw();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
     ESP_LOGI(TAG, ">>> Reading weight...");
     float weight_g = hx711_read_grams();
     ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
 
-    // Step 3: Place object under camera
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> Now place object under camera... (5 seconds)");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    // Step 3.5: Second ultrasonic reading (with object)
+    // Step 3: Measure object height (object is already on the board under camera)
+    ultrasonic_init();
+    g_baseline_cm = FIXED_BASELINE_CM;
     ESP_LOGI(TAG, ">>> Measuring object distance...");
     g_object_cm = ultrasonic_measure();
     ESP_LOGI(TAG, ">>> Ultrasonic raw reading: %.2f cm (baseline=%.2f cm)", g_object_cm, g_baseline_cm);
@@ -1336,10 +1155,16 @@ void app_main(void)
     // Return camera buffer immediately
     esp_camera_fb_return(fb);
 
+#if RAW_CAPTURE_MODE
+    // RAW MODE: skip processing, upload image as-is for board coordinate calibration
+    ESP_LOGI(TAG, ">>> RAW CAPTURE MODE — skipping processing, uploading raw image...");
+    min_area_rect_t rect = {0};
+#else
     // Process: find min area rectangle (this modifies img_copy)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> Processing image...");
     min_area_rect_t rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
+#endif
 
     // Print results
     ESP_LOGI(TAG, "");
@@ -1383,20 +1208,12 @@ void app_main(void)
         ESP_LOGW(TAG, "No object detected!");
     }
 
-    // Restart WiFi for upload
+    // Connect WiFi, fetch cal_factor, and upload
+    bool wifi_ok = wifi_init();
     if (wifi_ok) {
-        ESP_LOGI(TAG, "Restarting WiFi for upload...");
-        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-        s_retry_num = 0;
-        esp_wifi_start();
-        // Wait for reconnection
-        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
-                            pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-        // Let connection stabilize before uploading
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        fetch_cal_factor();
     }
 
-    // Upload result image via WiFi
     if (wifi_ok) {
         // Build PGM in memory (header + raw pixels)
         char pgm_header[32];
