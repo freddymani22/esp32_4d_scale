@@ -19,15 +19,19 @@
 #include "esp_http_client.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_timer.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
 // ============== WIFI CONFIGURATION ==============
 #define WIFI_SSID       "VithamasTech_Gnd Flr Hall_1"
 #define WIFI_PASS       "#Newbusiness$"
 #define SERVER_IP       "192.168.0.243"
 #define SERVER_PORT     8080
+#define SERVER_TCP_PORT 9000
 #define WIFI_MAX_RETRY  10
 #define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
+static char g_trigger_mode[8] = "tcp";
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -326,6 +330,7 @@ static float ultrasonic_read_cm(void)
     // Speed of sound = 331.3 + (0.606 * temp_C) m/s => cm/us
     float speed_cm_per_us = (331.3f + 0.606f * ROOM_TEMP_C) / 10000.0f;
     float distance_cm = (float)duration_us * speed_cm_per_us / 2.0f * US_CAL_FACTOR;
+    ESP_LOGI(TAG, "  US: duration=%lld us, distance=%.2f cm", duration_us, distance_cm);
     return distance_cm;
 }
 
@@ -456,12 +461,12 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static void fetch_cal_factor(void)
+static void fetch_config(void)
 {
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%d/api/config", SERVER_IP, SERVER_PORT);
 
-    char body[128] = {0};
+    char body[192] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
 
     esp_http_client_config_t config = {
@@ -476,12 +481,11 @@ static void fetch_cal_factor(void)
     esp_err_t err = esp_http_client_perform(client);
 
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
-        // Simple JSON parse: find "cal_factor": <number>
+        // Parse cal_factor
         const char *key = "\"cal_factor\"";
         char *pos = strstr(body, key);
         if (pos) {
             pos += strlen(key);
-            // Skip colon and whitespace
             while (*pos == ':' || *pos == ' ' || *pos == '\t') pos++;
             float val = strtof(pos, NULL);
             if (val > 0.0f) {
@@ -493,11 +497,29 @@ static void fetch_cal_factor(void)
         } else {
             ESP_LOGW(TAG, "cal_factor not found in response: %s", body);
         }
+
+        // Parse trigger_mode
+        const char *tkey = "\"trigger_mode\"";
+        char *tpos = strstr(body, tkey);
+        if (tpos) {
+            tpos += strlen(tkey);
+            while (*tpos == ':' || *tpos == ' ' || *tpos == '\t') tpos++;
+            if (*tpos == '"') {
+                tpos++;  // skip opening quote
+                int i = 0;
+                while (*tpos && *tpos != '"' && i < (int)(sizeof(g_trigger_mode) - 1)) {
+                    g_trigger_mode[i++] = *tpos++;
+                }
+                g_trigger_mode[i] = '\0';
+                ESP_LOGI(TAG, "Fetched trigger_mode from server: %s", g_trigger_mode);
+            }
+        } else {
+            ESP_LOGW(TAG, "trigger_mode not found in response, using default: %s", g_trigger_mode);
+        }
     } else {
-        ESP_LOGW(TAG, "Failed to fetch config (err=%s, status=%d), using default cal_factor=%.4f",
+        ESP_LOGW(TAG, "Failed to fetch config (err=%s, status=%d), using defaults",
                  esp_err_to_name(err),
-                 err == ESP_OK ? esp_http_client_get_status_code(client) : -1,
-                 hx711_cal_factor);
+                 err == ESP_OK ? esp_http_client_get_status_code(client) : -1);
     }
 
     esp_http_client_cleanup(client);
@@ -1007,6 +1029,88 @@ cleanup:
     return result;
 }
 
+// ============== TRIGGER: HTTP LONG POLL ==============
+
+static bool wait_for_trigger_poll(void)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/wait", SERVER_IP, SERVER_PORT);
+
+    char body[64] = {0};
+    http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 70000,   // server holds 60s; give 10s margin
+        .event_handler = http_event_handler,
+        .user_data = &resp,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+
+    bool triggered = false;
+    if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+        triggered = (strstr(body, "\"trigger\":true") != NULL ||
+                     strstr(body, "\"trigger\": true") != NULL);
+        ESP_LOGI(TAG, "Poll response: %s -> triggered=%d", body, triggered);
+    } else {
+        ESP_LOGW(TAG, "Poll request failed (err=%s, status=%d)",
+                 esp_err_to_name(err),
+                 err == ESP_OK ? esp_http_client_get_status_code(client) : -1);
+    }
+
+    esp_http_client_cleanup(client);
+    return triggered;
+}
+
+// ============== TRIGGER: TCP SOCKET ==============
+
+static bool wait_for_trigger_tcp(void)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "TCP: socket() failed, errno=%d", errno);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_TCP_PORT);
+    server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+
+    ESP_LOGI(TAG, "TCP: connecting to %s:%d...", SERVER_IP, SERVER_TCP_PORT);
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+        ESP_LOGW(TAG, "TCP: connect() failed, errno=%d", errno);
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "TCP: connected. Waiting for MEASURE command...");
+    char buf[32];
+    bool triggered = false;
+    while (1) {
+        int len = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (len <= 0) {
+            ESP_LOGW(TAG, "TCP: connection closed or error (len=%d, errno=%d)", len, errno);
+            break;
+        }
+        buf[len] = '\0';
+        if (strstr(buf, "MEASURE")) {
+            ESP_LOGI(TAG, "TCP: received MEASURE command!");
+            triggered = true;
+            break;
+        }
+    }
+
+    close(sock);
+    return triggered;
+}
+
 // ============== HARDWARE INIT FUNCTIONS ==============
 
 static void print_memory_info(void)
@@ -1083,7 +1187,7 @@ void app_main(void)
         return;
     }
 
-    // Let auto-exposure settle by discarding frames
+    // Camera warmup: let auto-exposure settle
     ESP_LOGI(TAG, "Camera warming up (auto-exposure)...");
     for (int i = 0; i < 15; i++) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -1091,150 +1195,159 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    // Step 1: Read tare on empty board (no WiFi = clean ADC readings)
+    // Tare on empty board (before WiFi for clean ADC readings)
     hx711_init();
     hx711_read_tare();
 
-    // Step 2: Place object on the board and weigh
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> Place object on the board... (5 seconds)");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, ">>> Reading weight...");
-    float weight_g = hx711_read_grams();
-    ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
-
-    // Step 3: Measure object height (object is already on the board under camera)
     ultrasonic_init();
-    g_baseline_cm = FIXED_BASELINE_CM;
-    ESP_LOGI(TAG, ">>> Measuring object distance...");
-    g_object_cm = ultrasonic_measure();
-    ESP_LOGI(TAG, ">>> Ultrasonic raw reading: %.2f cm (baseline=%.2f cm)", g_object_cm, g_baseline_cm);
-    if (g_object_cm > 0 && g_baseline_cm > 0) {
-        g_object_height_cm = g_baseline_cm - g_object_cm;
-        if (g_object_height_cm < 0) g_object_height_cm = 0;
-        g_dynamic_ppmm = PIXELS_PER_MM_REF * (CALIBRATION_DIST_CM / g_object_cm);
-        ESP_LOGI(TAG, ">>> Object distance: %.2f cm", g_object_cm);
-        ESP_LOGI(TAG, ">>> Object height:   %.2f cm", g_object_height_cm);
-        ESP_LOGI(TAG, ">>> Dynamic ppmm:    %.4f (ref %.4f at %.1f cm)",
-                 g_dynamic_ppmm, PIXELS_PER_MM_REF, CALIBRATION_DIST_CM);
-    } else {
-        ESP_LOGW(TAG, ">>> Object distance: N/A — using reference ppmm");
-        g_dynamic_ppmm = PIXELS_PER_MM_REF;
-    }
 
-    // Step 4: Capture image — flush stale frames first
-    ESP_LOGI(TAG, ">>> Flushing stale camera frames...");
-    for (int i = 0; i < 5; i++) {
-        camera_fb_t *discard = esp_camera_fb_get();
-        if (discard) esp_camera_fb_return(discard);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    ESP_LOGI(TAG, ">>> Capturing image...");
-    camera_fb_t *fb = esp_camera_fb_get();
-
-    if (!fb) {
-        ESP_LOGE(TAG, "Capture failed!");
-        return;
-    }
-
-    ESP_LOGI(TAG, "Captured: %dx%d", fb->width, fb->height);
-
-    // Copy image to our own buffer (camera buffer can have issues after modification)
-    size_t img_size = fb->width * fb->height;
-    uint8_t *img_copy = heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM);
-    if (!img_copy) {
-        ESP_LOGE(TAG, "Failed to allocate image buffer!");
-        esp_camera_fb_return(fb);
-        return;
-    }
-    memcpy(img_copy, fb->buf, img_size);
-    int img_width = fb->width;
-    int img_height = fb->height;
-
-    // Return camera buffer immediately
-    esp_camera_fb_return(fb);
-
-#if RAW_CAPTURE_MODE
-    // RAW MODE: skip processing, upload image as-is for board coordinate calibration
-    ESP_LOGI(TAG, ">>> RAW CAPTURE MODE — skipping processing, uploading raw image...");
-    min_area_rect_t rect = {0};
-#else
-    // Process: find min area rectangle (this modifies img_copy)
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">>> Processing image...");
-    min_area_rect_t rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
-#endif
-
-    // Print results
-    ESP_LOGI(TAG, "");
-    if (rect.valid) {
-        ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
-        ESP_LOGI(TAG, "║         MEASUREMENT RESULTS           ║");
-        ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Center: (%.1f, %.1f)                 ", rect.center.x, rect.center.y);
-        ESP_LOGI(TAG, "║  Angle:  %.1f°                        ", rect.angle);
-        ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Size (pixels):                       ║");
-        ESP_LOGI(TAG, "║    Length: %.1f px                    ", rect.width);
-        ESP_LOGI(TAG, "║    Width:  %.1f px                    ", rect.height);
-        ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Dimensions:                          ║");
-        ESP_LOGI(TAG, "║    Length: %.1f mm                    ", rect.length_mm);
-        ESP_LOGI(TAG, "║    Width:  %.1f mm                    ", rect.width_mm);
-        if (g_object_cm > 0) {
-            ESP_LOGI(TAG, "║    Height: %.2f cm (%.1f mm)          ", g_object_height_cm, g_object_height_cm * 10.0f);
-        } else {
-            ESP_LOGI(TAG, "║    Height: N/A                        ║");
-        }
-        ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Weight:                              ║");
-        ESP_LOGI(TAG, "║    %.1f g  (%.3f kg)                  ", weight_g, weight_g / 1000.0f);
-        ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║  Ultrasonic:                          ║");
-        if (g_baseline_cm > 0) {
-            ESP_LOGI(TAG, "║    Baseline:  %.2f cm                 ", g_baseline_cm);
-        } else {
-            ESP_LOGI(TAG, "║    Baseline:  N/A                     ║");
-        }
-        if (g_object_cm > 0) {
-            ESP_LOGI(TAG, "║    Object:    %.2f cm                 ", g_object_cm);
-        } else {
-            ESP_LOGI(TAG, "║    Object:    N/A                     ║");
-        }
-        ESP_LOGI(TAG, "║    PPMM:      %.4f                   ", g_dynamic_ppmm);
-        ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
-    } else {
-        ESP_LOGW(TAG, "No object detected!");
-    }
-
-    // Connect WiFi, fetch cal_factor, and upload
+    // Connect WiFi and fetch server config (cal_factor + trigger_mode)
     bool wifi_ok = wifi_init();
     if (wifi_ok) {
-        fetch_cal_factor();
+        fetch_config();
     }
 
-    if (wifi_ok) {
-        // Build PGM in memory (header + raw pixels)
-        char pgm_header[32];
-        int hdr_len = snprintf(pgm_header, sizeof(pgm_header), "P5\n%d %d\n255\n", img_width, img_height);
-        size_t pgm_size = hdr_len + img_size;
-        uint8_t *pgm_buf = heap_caps_malloc(pgm_size, MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "Trigger mode: %s", g_trigger_mode);
 
-        if (pgm_buf) {
-            memcpy(pgm_buf, pgm_header, hdr_len);
-            memcpy(pgm_buf + hdr_len, img_copy, img_size);
+    // ── Main measurement loop ─────────────────────────────────────────────────
+    while (1) {
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Ready — waiting for trigger...");
 
-            upload_result(pgm_buf, pgm_size, &rect, weight_g);
-            heap_caps_free(pgm_buf);
+        if (strcmp(g_trigger_mode, "poll") == 0) {
+            while (!wait_for_trigger_poll()) {
+                // server timed out (60s), retry immediately
+            }
         } else {
-            ESP_LOGE(TAG, "Failed to allocate upload buffer!");
+            // TCP mode: reconnect on failure
+            while (!wait_for_trigger_tcp()) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
         }
+
+        ESP_LOGI(TAG, ">>> Triggered! Starting measurement...");
+
+        // Weigh
+        float weight_g = hx711_read_grams();
+        ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
+
+        // Ultrasonic height
+        g_baseline_cm = FIXED_BASELINE_CM;
+        ESP_LOGI(TAG, ">>> Measuring object distance...");
+        g_object_cm = ultrasonic_measure();
+        if (g_object_cm > 0 && g_baseline_cm > 0) {
+            g_object_height_cm = g_baseline_cm - g_object_cm;
+            if (g_object_height_cm < 0) g_object_height_cm = 0;
+            g_dynamic_ppmm = PIXELS_PER_MM_REF * (CALIBRATION_DIST_CM / g_object_cm);
+            ESP_LOGI(TAG, ">>> Object distance: %.2f cm", g_object_cm);
+            ESP_LOGI(TAG, ">>> Object height:   %.2f cm", g_object_height_cm);
+            ESP_LOGI(TAG, ">>> Dynamic ppmm:    %.4f (ref %.4f at %.1f cm)",
+                     g_dynamic_ppmm, PIXELS_PER_MM_REF, CALIBRATION_DIST_CM);
+        } else {
+            g_object_height_cm = 0;
+            g_dynamic_ppmm = PIXELS_PER_MM_REF;
+            ESP_LOGW(TAG, ">>> Object distance: N/A — using reference ppmm");
+        }
+
+        // Flush stale frames and capture
+        ESP_LOGI(TAG, ">>> Flushing stale camera frames...");
+        for (int i = 0; i < 5; i++) {
+            camera_fb_t *discard = esp_camera_fb_get();
+            if (discard) esp_camera_fb_return(discard);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        ESP_LOGI(TAG, ">>> Capturing image...");
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Capture failed! Skipping this measurement.");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Captured: %dx%d", fb->width, fb->height);
+
+        size_t img_size = fb->width * fb->height;
+        uint8_t *img_copy = heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM);
+        if (!img_copy) {
+            ESP_LOGE(TAG, "Failed to allocate image buffer!");
+            esp_camera_fb_return(fb);
+            continue;
+        }
+        memcpy(img_copy, fb->buf, img_size);
+        int img_width  = fb->width;
+        int img_height = fb->height;
+        esp_camera_fb_return(fb);
+
+        // Process image
+        min_area_rect_t rect = {0};
+#if RAW_CAPTURE_MODE
+        ESP_LOGI(TAG, ">>> RAW CAPTURE MODE — skipping processing, uploading raw image...");
+#else
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, ">>> Processing image...");
+        rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
+#endif
+
+        // Print results
+        ESP_LOGI(TAG, "");
+        if (rect.valid) {
+            ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
+            ESP_LOGI(TAG, "║         MEASUREMENT RESULTS           ║");
+            ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
+            ESP_LOGI(TAG, "║  Center: (%.1f, %.1f)                 ", rect.center.x, rect.center.y);
+            ESP_LOGI(TAG, "║  Angle:  %.1f°                        ", rect.angle);
+            ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
+            ESP_LOGI(TAG, "║  Size (pixels):                       ║");
+            ESP_LOGI(TAG, "║    Length: %.1f px                    ", rect.width);
+            ESP_LOGI(TAG, "║    Width:  %.1f px                    ", rect.height);
+            ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
+            ESP_LOGI(TAG, "║  Dimensions:                          ║");
+            ESP_LOGI(TAG, "║    Length: %.1f mm                    ", rect.length_mm);
+            ESP_LOGI(TAG, "║    Width:  %.1f mm                    ", rect.width_mm);
+            if (g_object_cm > 0) {
+                ESP_LOGI(TAG, "║    Height: %.2f cm (%.1f mm)          ", g_object_height_cm, g_object_height_cm * 10.0f);
+            } else {
+                ESP_LOGI(TAG, "║    Height: N/A                        ║");
+            }
+            ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
+            ESP_LOGI(TAG, "║  Weight:                              ║");
+            ESP_LOGI(TAG, "║    %.1f g  (%.3f kg)                  ", weight_g, weight_g / 1000.0f);
+            ESP_LOGI(TAG, "╠═══════════════════════════════════════╣");
+            ESP_LOGI(TAG, "║  Ultrasonic:                          ║");
+            if (g_baseline_cm > 0) {
+                ESP_LOGI(TAG, "║    Baseline:  %.2f cm                 ", g_baseline_cm);
+            } else {
+                ESP_LOGI(TAG, "║    Baseline:  N/A                     ║");
+            }
+            if (g_object_cm > 0) {
+                ESP_LOGI(TAG, "║    Object:    %.2f cm                 ", g_object_cm);
+            } else {
+                ESP_LOGI(TAG, "║    Object:    N/A                     ║");
+            }
+            ESP_LOGI(TAG, "║    PPMM:      %.4f                   ", g_dynamic_ppmm);
+            ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
+        } else {
+            ESP_LOGW(TAG, "No object detected!");
+        }
+
+        // Upload
+        if (wifi_ok) {
+            char pgm_header[32];
+            int hdr_len = snprintf(pgm_header, sizeof(pgm_header), "P5\n%d %d\n255\n", img_width, img_height);
+            size_t pgm_size = hdr_len + img_size;
+            uint8_t *pgm_buf = heap_caps_malloc(pgm_size, MALLOC_CAP_SPIRAM);
+            if (pgm_buf) {
+                memcpy(pgm_buf, pgm_header, hdr_len);
+                memcpy(pgm_buf + hdr_len, img_copy, img_size);
+                upload_result(pgm_buf, pgm_size, &rect, weight_g);
+                heap_caps_free(pgm_buf);
+            } else {
+                ESP_LOGE(TAG, "Failed to allocate upload buffer!");
+            }
+        }
+
+        heap_caps_free(img_copy);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Done. Waiting for next trigger...");
     }
-
-    // Free image copy
-    heap_caps_free(img_copy);
-
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Done!");
 }

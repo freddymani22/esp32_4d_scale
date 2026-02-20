@@ -1,8 +1,14 @@
 from flask import Flask, request, send_from_directory, render_template_string
 import os
 import json
+import threading
+import socket as sock_lib
 from datetime import datetime
 from PIL import Image
+
+trigger_event = threading.Event()
+tcp_client_conn = None
+tcp_client_lock = threading.Lock()
 
 app = Flask(__name__)
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -96,11 +102,14 @@ def upload():
     return {"status": "ok", "filename": img_filename}, 200
 
 
-# ESP32 fetches calibration factor on boot
+# ESP32 fetches calibration factor and trigger mode on boot
 @app.route("/api/config")
 def get_config():
     cfg = load_config()
-    return {"cal_factor": cfg["cal_factor"]}
+    return {
+        "cal_factor": cfg.get("cal_factor", DEFAULT_CAL_FACTOR),
+        "trigger_mode": cfg.get("trigger_mode", "tcp"),
+    }
 
 
 # User submits known weight to calibrate
@@ -130,6 +139,40 @@ def calibrate():
 
     print(f"Calibrated: raw_diff={raw_diff}, known={known_weight_g}g -> cal_factor={cfg['cal_factor']}")
     return {"status": "ok", "cal_factor": cfg["cal_factor"], "raw_diff": raw_diff}
+
+
+# Frontend triggers a measurement
+@app.route("/api/trigger", methods=["POST"])
+def trigger():
+    global tcp_client_conn
+    cfg = load_config()
+    mode = cfg.get("trigger_mode", "tcp")
+
+    if mode == "poll":
+        trigger_event.set()
+        return {"status": "ok", "mode": "poll"}
+    else:
+        with tcp_client_lock:
+            conn = tcp_client_conn
+        if conn is None:
+            return {"status": "error", "message": "No ESP32 connected on TCP"}, 503
+        try:
+            conn.sendall(b"MEASURE\n")
+            return {"status": "ok", "mode": "tcp"}
+        except Exception as e:
+            with tcp_client_lock:
+                tcp_client_conn = None
+            return {"status": "error", "message": str(e)}, 503
+
+
+# ESP32 long-polls this until trigger fires (or 60s timeout)
+@app.route("/api/wait")
+def wait_trigger():
+    trigger_event.clear()
+    fired = trigger_event.wait(timeout=60)
+    if fired:
+        trigger_event.clear()
+    return {"trigger": fired}
 
 
 # View results in browser
@@ -204,11 +247,29 @@ PAGE_TEMPLATE = """
         .cal-result { color: #4fc3f7; font-size: 13px; margin-top: 8px; display: none; }
         .cal-current { color: #81c784; font-size: 13px; margin-bottom: 12px; }
         .raw-info { color: #666; font-size: 11px; margin-top: 4px; }
+        .trigger-section {
+            background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
+            padding: 20px; margin-bottom: 24px; max-width: 480px;
+        }
+        .trigger-section h2 { color: #4fc3f7; font-size: 16px; margin-bottom: 12px; }
+        .trigger-btn {
+            background: #4fc3f7; color: #000; border: none; border-radius: 6px;
+            padding: 10px 28px; font-size: 15px; font-weight: bold; cursor: pointer;
+        }
+        .trigger-btn:hover { background: #29b6f6; }
+        .trigger-btn:disabled { background: #555; color: #888; cursor: not-allowed; }
+        .trigger-result { font-size: 13px; margin-top: 8px; display: none; }
     </style>
 </head>
 <body>
     <h1>ESP32 4D Scale</h1>
     <p class="subtitle">{{ measurements|length }} measurement{{ 's' if measurements|length != 1 }} captured</p>
+
+    <div class="trigger-section">
+        <h2>Trigger Measurement</h2>
+        <button class="trigger-btn" id="triggerBtn" onclick="doTrigger()">&#9654; Measure Now</button>
+        <div class="trigger-result" id="triggerResult"></div>
+    </div>
 
     <div class="cal-section">
         <h2>HX711 Calibration</h2>
@@ -283,6 +344,32 @@ PAGE_TEMPLATE = """
     </div>
 
     <script>
+    async function doTrigger() {
+        const btn = document.getElementById('triggerBtn');
+        const result = document.getElementById('triggerResult');
+        btn.disabled = true;
+        btn.textContent = '...';
+        result.style.display = 'none';
+        try {
+            const resp = await fetch('/api/trigger', {method: 'POST'});
+            const data = await resp.json();
+            result.style.display = 'block';
+            if (resp.ok) {
+                result.style.color = '#4fc3f7';
+                result.textContent = 'Triggered via ' + data.mode + '. Measurement in progress...';
+            } else {
+                result.style.color = '#ef5350';
+                result.textContent = 'Error: ' + data.message;
+            }
+        } catch (e) {
+            result.style.display = 'block';
+            result.style.color = '#ef5350';
+            result.textContent = 'Request failed: ' + e.message;
+        }
+        btn.disabled = false;
+        btn.textContent = '\u25b6 Measure Now';
+    }
+
     async function doCalibrate() {
         const input = document.getElementById('knownWeight');
         const btn = document.getElementById('calBtn');
@@ -327,14 +414,43 @@ PAGE_TEMPLATE = """
 """
 
 
+def tcp_server_thread():
+    """Accept ESP32 TCP connections and store the latest for trigger delivery."""
+    global tcp_client_conn
+    server_sock = sock_lib.socket(sock_lib.AF_INET, sock_lib.SOCK_STREAM)
+    server_sock.setsockopt(sock_lib.SOL_SOCKET, sock_lib.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", 9000))
+    server_sock.listen(1)
+    print("TCP trigger server listening on port 9000")
+    while True:
+        try:
+            conn, addr = server_sock.accept()
+            print(f"TCP: ESP32 connected from {addr}")
+            with tcp_client_lock:
+                if tcp_client_conn:
+                    try:
+                        tcp_client_conn.close()
+                    except Exception:
+                        pass
+                tcp_client_conn = conn
+        except Exception as e:
+            print(f"TCP server error: {e}")
+            import time
+            time.sleep(1)
+
+
 if __name__ == "__main__":
-    import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    t = threading.Thread(target=tcp_server_thread, daemon=True)
+    t.start()
+
+    hostname = sock_lib.gethostname()
+    local_ip = sock_lib.gethostbyname(hostname)
     print(f"\n{'='*50}")
     print(f"  ESP32 4D Scale - Image Server")
     print(f"  Upload:  http://{local_ip}:8080/upload")
     print(f"  Viewer:  http://{local_ip}:8080/")
+    print(f"  Trigger: POST http://{local_ip}:8080/api/trigger")
+    print(f"  TCP:     {local_ip}:9000")
     print(f"  Saves to: {UPLOAD_DIR}")
     print(f"{'='*50}\n")
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=8080, threaded=True)
