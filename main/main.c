@@ -27,11 +27,15 @@
 #define WIFI_PASS       "#Newbusiness$"
 #define SERVER_IP       "192.168.0.243"
 #define SERVER_PORT     8080
-#define SERVER_TCP_PORT 9000
+#define SERVER_TCP_PORT  9000
 #define WIFI_MAX_RETRY  10
 #define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
 static char g_trigger_mode[8] = "tcp";
+static bool g_raw_capture = false;
+// 4-point polygon defining the plywood board region (overridden by server config)
+// Order: P0=TL, P1=TR, P2=BR, P3=BL  (but any convex order works)
+static int g_board_pts[4][2] = {{50,18},{195,18},{195,160},{50,160}};
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -466,7 +470,7 @@ static void fetch_config(void)
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%d/api/config", SERVER_IP, SERVER_PORT);
 
-    char body[192] = {0};
+    char body[256] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
 
     esp_http_client_config_t config = {
@@ -497,6 +501,61 @@ static void fetch_config(void)
         } else {
             ESP_LOGW(TAG, "cal_factor not found in response: %s", body);
         }
+
+        // Parse baseline_cm (manual override from frontend)
+        const char *bkey = "\"baseline_cm\"";
+        char *bpos = strstr(body, bkey);
+        if (bpos) {
+            bpos += strlen(bkey);
+            while (*bpos == ':' || *bpos == ' ' || *bpos == '\t') bpos++;
+            float bval = strtof(bpos, NULL);
+            if (bval > 0.0f) {
+                g_baseline_cm = bval;
+                ESP_LOGI(TAG, "Baseline overridden from server: %.2f cm", g_baseline_cm);
+            }
+        }
+
+        // Parse pixels_per_mm
+        const char *pkey = "\"pixels_per_mm\"";
+        char *ppos = strstr(body, pkey);
+        if (ppos) {
+            ppos += strlen(pkey);
+            while (*ppos == ':' || *ppos == ' ') ppos++;
+            float pval = strtof(ppos, NULL);
+            if (pval > 0.0f) {
+                g_dynamic_ppmm = pval;
+                ESP_LOGI(TAG, "pixels_per_mm from server: %.4f", g_dynamic_ppmm);
+            }
+        }
+
+        // Parse raw_capture
+        if (strstr(body, "\"raw_capture\":true") || strstr(body, "\"raw_capture\": true")) {
+            g_raw_capture = true;
+            ESP_LOGI(TAG, "Raw capture mode: ON");
+        } else {
+            g_raw_capture = false;
+        }
+
+        // Parse board polygon points (P0..P3, each with x and y)
+        const char *pt_keys[4][2] = {
+            {"\"board_p0x\"", "\"board_p0y\""},
+            {"\"board_p1x\"", "\"board_p1y\""},
+            {"\"board_p2x\"", "\"board_p2y\""},
+            {"\"board_p3x\"", "\"board_p3y\""},
+        };
+        for (int pi = 0; pi < 4; pi++) {
+            for (int ci = 0; ci < 2; ci++) {
+                char *cp = strstr(body, pt_keys[pi][ci]);
+                if (cp) {
+                    cp += strlen(pt_keys[pi][ci]);
+                    while (*cp == ':' || *cp == ' ') cp++;
+                    g_board_pts[pi][ci] = (int)strtol(cp, NULL, 10);
+                }
+            }
+        }
+        ESP_LOGI(TAG, "Board pts: (%d,%d) (%d,%d) (%d,%d) (%d,%d)",
+                 g_board_pts[0][0], g_board_pts[0][1], g_board_pts[1][0], g_board_pts[1][1],
+                 g_board_pts[2][0], g_board_pts[2][1], g_board_pts[3][0], g_board_pts[3][1]);
 
         // Parse trigger_mode
         const char *tkey = "\"trigger_mode\"";
@@ -895,10 +954,16 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
 {
     min_area_rect_t result = {0};
 
-    // Step 0: Crop to hardcoded white board region
-    int wb_x0 = BOARD_X0, wb_y0 = BOARD_Y0;
-    int wb_x1 = BOARD_X1, wb_y1 = BOARD_Y1;
-    ESP_LOGI(TAG, "Step 0: Board crop (%d,%d)-(%d,%d) [%dx%d]",
+    // Step 0: Compute bounding box of the 4-point board polygon
+    int wb_x0 = g_board_pts[0][0], wb_y0 = g_board_pts[0][1];
+    int wb_x1 = g_board_pts[0][0], wb_y1 = g_board_pts[0][1];
+    for (int pi = 1; pi < 4; pi++) {
+        if (g_board_pts[pi][0] < wb_x0) wb_x0 = g_board_pts[pi][0];
+        if (g_board_pts[pi][0] > wb_x1) wb_x1 = g_board_pts[pi][0];
+        if (g_board_pts[pi][1] < wb_y0) wb_y0 = g_board_pts[pi][1];
+        if (g_board_pts[pi][1] > wb_y1) wb_y1 = g_board_pts[pi][1];
+    }
+    ESP_LOGI(TAG, "Step 0: Board bbox (%d,%d)-(%d,%d) [%dx%d]",
              wb_x0, wb_y0, wb_x1, wb_y1, wb_x1 - wb_x0, wb_y1 - wb_y0);
 
     // Crop the white board region into a new buffer
@@ -926,6 +991,34 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
     // Step 1.5: Dilation to close edge gaps
     ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
     apply_dilation(binary, cw, ch, DILATION_ITERATIONS);
+
+    // Step 1.75: Polygon mask — zero edge pixels outside the board quadrilateral
+    // Uses ray-casting point-in-polygon test (works for any convex/concave polygon)
+    ESP_LOGI(TAG, "Step 1.75: Applying polygon mask...");
+    int masked = 0;
+    for (int cy = 0; cy < ch; cy++) {
+        for (int cx = 0; cx < cw; cx++) {
+            if (binary[cy * cw + cx] == 0) continue;
+            // Translate to full-image coordinates
+            float px = (float)(cx + wb_x0);
+            float py = (float)(cy + wb_y0);
+            // Ray-casting: count crossings of a ray from (px,py) going right
+            bool inside = false;
+            for (int i = 0, j = 3; i < 4; j = i++) {
+                float xi = g_board_pts[i][0], yi = g_board_pts[i][1];
+                float xj = g_board_pts[j][0], yj = g_board_pts[j][1];
+                if (((yi > py) != (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                }
+            }
+            if (!inside) {
+                binary[cy * cw + cx] = 0;
+                masked++;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "  Masked %d edge pixels outside polygon", masked);
 
     // Step 2: Trace contours and pick the largest
     int min_bbox_area = (cw * ch * MIN_BBOX_AREA_PCT) / 100;
@@ -1006,12 +1099,20 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
     ESP_LOGI(TAG, "Step 4: Finding minimum area rectangle...");
     result = find_min_area_rect(hull, hull_count, pixels_per_mm);
 
-    // Mask grayscale outside white board for visualization
+    // Mask grayscale outside board polygon for visualization
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            if (x < wb_x0 || x >= wb_x1 || y < wb_y0 || y >= wb_y1) {
-                grayscale[y * width + x] = 0;
+            float px = (float)x, py = (float)y;
+            bool inside = false;
+            for (int i = 0, j = 3; i < 4; j = i++) {
+                float xi = g_board_pts[i][0], yi = g_board_pts[i][1];
+                float xj = g_board_pts[j][0], yj = g_board_pts[j][1];
+                if (((yi > py) != (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                }
             }
+            if (!inside) grayscale[y * width + x] = 0;
         }
     }
 
@@ -1090,7 +1191,7 @@ static bool wait_for_trigger_tcp(void)
         return false;
     }
 
-    ESP_LOGI(TAG, "TCP: connected. Waiting for MEASURE command...");
+    ESP_LOGI(TAG, "TCP: connected. Waiting for command...");
     char buf[32];
     bool triggered = false;
     while (1) {
@@ -1100,8 +1201,13 @@ static bool wait_for_trigger_tcp(void)
             break;
         }
         buf[len] = '\0';
-        if (strstr(buf, "MEASURE")) {
-            ESP_LOGI(TAG, "TCP: received MEASURE command!");
+        if (strstr(buf, "TARE_MEASURE")) {
+            ESP_LOGI(TAG, "TCP: TARE_MEASURE — re-taring first...");
+            hx711_read_tare();
+            triggered = true;
+            break;
+        } else if (strstr(buf, "MEASURE")) {
+            ESP_LOGI(TAG, "TCP: MEASURE command received!");
             triggered = true;
             break;
         }
@@ -1201,6 +1307,15 @@ void app_main(void)
 
     ultrasonic_init();
 
+    // Measure baseline distance to empty board (once at boot)
+    ESP_LOGI(TAG, ">>> Measuring baseline (empty board)...");
+    g_baseline_cm = ultrasonic_measure();
+    if (g_baseline_cm <= 0) {
+        ESP_LOGW(TAG, "Baseline measurement failed, using fixed value %.2f cm", FIXED_BASELINE_CM);
+        g_baseline_cm = FIXED_BASELINE_CM;
+    }
+    ESP_LOGI(TAG, ">>> Baseline: %.2f cm", g_baseline_cm);
+
     // Connect WiFi and fetch server config (cal_factor + trigger_mode)
     bool wifi_ok = wifi_init();
     if (wifi_ok) {
@@ -1225,15 +1340,17 @@ void app_main(void)
             }
         }
 
-        ESP_LOGI(TAG, ">>> Triggered! Starting measurement...");
+        ESP_LOGI(TAG, ">>> Triggered! Refreshing config...");
+        if (wifi_ok) fetch_config();
+
+        ESP_LOGI(TAG, ">>> Starting measurement...");
 
         // Weigh
         float weight_g = hx711_read_grams();
         ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
 
-        // Ultrasonic height
-        g_baseline_cm = FIXED_BASELINE_CM;
-        ESP_LOGI(TAG, ">>> Measuring object distance...");
+        // Ultrasonic height (baseline was captured at boot)
+        ESP_LOGI(TAG, ">>> Measuring object distance (baseline=%.2f cm)...", g_baseline_cm);
         g_object_cm = ultrasonic_measure();
         if (g_object_cm > 0 && g_baseline_cm > 0) {
             g_object_height_cm = g_baseline_cm - g_object_cm;
@@ -1245,8 +1362,9 @@ void app_main(void)
                      g_dynamic_ppmm, PIXELS_PER_MM_REF, CALIBRATION_DIST_CM);
         } else {
             g_object_height_cm = 0;
-            g_dynamic_ppmm = PIXELS_PER_MM_REF;
-            ESP_LOGW(TAG, ">>> Object distance: N/A — using reference ppmm");
+            // Only fall back to PIXELS_PER_MM_REF if server didn't provide a value
+            if (g_dynamic_ppmm <= 0.0f) g_dynamic_ppmm = PIXELS_PER_MM_REF;
+            ESP_LOGW(TAG, ">>> Object distance: N/A — using ppmm=%.4f", g_dynamic_ppmm);
         }
 
         // Flush stale frames and capture
@@ -1280,13 +1398,13 @@ void app_main(void)
 
         // Process image
         min_area_rect_t rect = {0};
-#if RAW_CAPTURE_MODE
-        ESP_LOGI(TAG, ">>> RAW CAPTURE MODE — skipping processing, uploading raw image...");
-#else
-        ESP_LOGI(TAG, "");
-        ESP_LOGI(TAG, ">>> Processing image...");
-        rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
-#endif
+        if (g_raw_capture) {
+            ESP_LOGI(TAG, ">>> RAW CAPTURE MODE — skipping processing, uploading raw image...");
+        } else {
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, ">>> Processing image...");
+            rect = process_image(img_copy, img_width, img_height, g_dynamic_ppmm);
+        }
 
         // Print results
         ESP_LOGI(TAG, "");

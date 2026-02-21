@@ -97,8 +97,23 @@ def upload():
     measurements.insert(0, entry)
     save_measurements(measurements)
 
-    print(f"  -> L={entry['length_mm']:.1f} x W={entry['width_mm']:.1f} mm, H={entry['height_cm']:.2f} cm, "
-          f"{entry['weight_g']:.1f} g, ppmm={entry['pixels_per_mm']:.4f}")
+    sep = "=" * 44
+    print(f"\n{sep}")
+    print(f"  MEASUREMENT  —  {entry['timestamp']}")
+    print(sep)
+    if entry["valid"]:
+        print(f"  Length   : {entry['length_mm']:.1f} mm  ({entry['length_mm']/10:.2f} cm)")
+        print(f"  Width    : {entry['width_mm']:.1f} mm  ({entry['width_mm']/10:.2f} cm)")
+        print(f"  Height   : {entry['height_cm']:.2f} cm  ({entry['height_cm']*10:.1f} mm)")
+        print(f"  Angle    : {entry['angle']:.1f} deg")
+    else:
+        print(f"  Detection: NO OBJECT DETECTED")
+    print(f"  Weight   : {entry['weight_g']:.1f} g  ({entry['weight_g']/1000:.3f} kg)")
+    print(f"  Baseline : {entry['baseline_cm']:.2f} cm")
+    print(f"  Object   : {entry['object_cm']:.2f} cm" if entry['object_cm'] > 0 else "  Object   : N/A")
+    print(f"  PPMM     : {entry['pixels_per_mm']:.4f}")
+    print(f"  Image    : {img_filename}")
+    print(f"{sep}\n")
     return {"status": "ok", "filename": img_filename}, 200
 
 
@@ -109,6 +124,13 @@ def get_config():
     return {
         "cal_factor": cfg.get("cal_factor", DEFAULT_CAL_FACTOR),
         "trigger_mode": cfg.get("trigger_mode", "tcp"),
+        "baseline_cm": cfg.get("baseline_cm", 0),
+        "raw_capture": cfg.get("raw_capture", False),
+        "board_p0x": cfg.get("board_p0x", 50),  "board_p0y": cfg.get("board_p0y", 18),
+        "board_p1x": cfg.get("board_p1x", 195), "board_p1y": cfg.get("board_p1y", 18),
+        "board_p2x": cfg.get("board_p2x", 195), "board_p2y": cfg.get("board_p2y", 160),
+        "board_p3x": cfg.get("board_p3x", 50),  "board_p3y": cfg.get("board_p3y", 160),
+        "pixels_per_mm": cfg.get("pixels_per_mm", 0.1644),
     }
 
 
@@ -141,12 +163,65 @@ def calibrate():
     return {"status": "ok", "cal_factor": cfg["cal_factor"], "raw_diff": raw_diff}
 
 
+# Save board crop coordinates + raw_capture flag
+@app.route("/api/set_board_crop", methods=["POST"])
+def set_board_crop():
+    body = request.get_json()
+    if not body:
+        return {"status": "error", "message": "missing body"}, 400
+    cfg = load_config()
+    if "raw_capture" in body:
+        cfg["raw_capture"] = bool(body["raw_capture"])
+    for key in ("board_p0x","board_p0y","board_p1x","board_p1y",
+                "board_p2x","board_p2y","board_p3x","board_p3y"):
+        if key in body:
+            cfg[key] = int(body[key])
+    if "pixels_per_mm" in body:
+        cfg["pixels_per_mm"] = round(float(body["pixels_per_mm"]), 4)
+    save_config(cfg)
+    pt_keys = ["board_p0x","board_p0y","board_p1x","board_p1y",
+               "board_p2x","board_p2y","board_p3x","board_p3y","raw_capture","pixels_per_mm"]
+    return {"status": "ok", "config": {k: cfg[k] for k in pt_keys if k in cfg}}
+
+
+# Save trigger mode
+@app.route("/api/set_trigger_mode", methods=["POST"])
+def set_trigger_mode():
+    body = request.get_json()
+    if not body or "trigger_mode" not in body:
+        return {"status": "error", "message": "missing trigger_mode"}, 400
+    mode = body["trigger_mode"]
+    if mode not in ("tcp", "poll"):
+        return {"status": "error", "message": "trigger_mode must be tcp or poll"}, 400
+    cfg = load_config()
+    cfg["trigger_mode"] = mode
+    save_config(cfg)
+    return {"status": "ok", "trigger_mode": mode}
+
+
+# Save baseline distance
+@app.route("/api/set_baseline", methods=["POST"])
+def set_baseline():
+    body = request.get_json()
+    if not body or "baseline_cm" not in body:
+        return {"status": "error", "message": "missing baseline_cm"}, 400
+    val = float(body["baseline_cm"])
+    if val <= 0:
+        return {"status": "error", "message": "baseline_cm must be positive"}, 400
+    cfg = load_config()
+    cfg["baseline_cm"] = round(val, 2)
+    save_config(cfg)
+    return {"status": "ok", "baseline_cm": cfg["baseline_cm"]}
+
+
 # Frontend triggers a measurement
 @app.route("/api/trigger", methods=["POST"])
 def trigger():
     global tcp_client_conn
     cfg = load_config()
     mode = cfg.get("trigger_mode", "tcp")
+    tare_first = request.get_json(silent=True) or {}
+    tare_first = bool(tare_first.get("tare_first", False))
 
     if mode == "poll":
         trigger_event.set()
@@ -157,8 +232,9 @@ def trigger():
         if conn is None:
             return {"status": "error", "message": "No ESP32 connected on TCP"}, 503
         try:
-            conn.sendall(b"MEASURE\n")
-            return {"status": "ok", "mode": "tcp"}
+            cmd = b"TARE_MEASURE\n" if tare_first else b"MEASURE\n"
+            conn.sendall(cmd)
+            return {"status": "ok", "mode": "tcp", "tare_first": tare_first}
         except Exception as e:
             with tcp_client_lock:
                 tcp_client_conn = None
@@ -267,20 +343,85 @@ PAGE_TEMPLATE = """
 
     <div class="trigger-section">
         <h2>Trigger Measurement</h2>
+        <div class="cal-current" style="margin-bottom:12px;">
+            Mode:
+            <label style="margin-left:10px;cursor:pointer;">
+                <input type="radio" name="triggerMode" value="tcp" {% if config.get('trigger_mode','tcp')=='tcp' %}checked{% endif %} onchange="doSetTriggerMode('tcp')"> TCP
+            </label>
+            <label style="margin-left:16px;cursor:pointer;">
+                <input type="radio" name="triggerMode" value="poll" {% if config.get('trigger_mode','tcp')=='poll' %}checked{% endif %} onchange="doSetTriggerMode('poll')"> Long Poll
+            </label>
+            <span id="modeResult" style="margin-left:12px;font-size:12px;color:#888;"></span>
+        </div>
+        <div style="margin-bottom:12px;display:flex;flex-direction:column;gap:8px;">
+            <label style="cursor:pointer;color:#aaa;font-size:13px;">
+                <input type="checkbox" id="tareFirst"> Tare before measuring
+            </label>
+            <label style="cursor:pointer;color:#aaa;font-size:13px;">
+                <input type="checkbox" id="rawCaptureCheck" {% if config.get('raw_capture') %}checked{% endif %} onchange="doSetRawCapture(this.checked)"> Raw capture (unprocessed image)
+            </label>
+        </div>
         <button class="trigger-btn" id="triggerBtn" onclick="doTrigger()">&#9654; Measure Now</button>
         <div class="trigger-result" id="triggerResult"></div>
     </div>
 
     <div class="cal-section">
-        <h2>HX711 Calibration</h2>
-        <div class="cal-current">Current cal_factor: <strong id="currentCal">{{ config.cal_factor }}</strong></div>
-        <div class="cal-row">
-            <label>Known weight (g):</label>
-            <input type="number" id="knownWeight" step="0.1" min="0.1" placeholder="e.g. 1220">
-            <button class="cal-btn" id="calBtn" onclick="doCalibrate()">Calibrate</button>
+        <h2>Baseline Distance</h2>
+        <div class="cal-current">Current baseline: <strong id="currentBaseline">{{ config.get('baseline_cm', 0) }}</strong> cm
+            {% if config.get('baseline_cm', 0) == 0 %}<span style="color:#888"> (auto — measured at boot)</span>{% endif %}
         </div>
-        <div class="cal-info">Uses the latest measurement's raw tare &amp; weighted values to compute cal_factor.</div>
-        <div class="cal-result" id="calResult"></div>
+        <div class="cal-row">
+            <label>Distance (cm):</label>
+            <input type="number" id="baselineInput" step="0.1" min="1" placeholder="e.g. 153.5">
+            <button class="cal-btn" onclick="doSetBaseline()">Save</button>
+        </div>
+        <div class="cal-info">Set to 0 to let the ESP32 measure it automatically on next boot.</div>
+        <div class="cal-result" id="baselineResult"></div>
+    </div>
+
+    <div class="cal-section">
+        <h2>Board Calibration</h2>
+        <div class="cal-info" style="margin-bottom:10px;">Enable "Raw capture" above, trigger a shot, run <code>find_coords.py</code> on the image and click all 4 plywood corners.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+            <div class="dim-box">
+                <div class="dim-label">P0 — Top-Left</div>
+                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
+                    <input type="number" id="bp0x" value="{{ config.get('board_p0x', 50) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                    <input type="number" id="bp0y" value="{{ config.get('board_p0y', 18) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                </div>
+            </div>
+            <div class="dim-box">
+                <div class="dim-label">P1 — Top-Right</div>
+                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
+                    <input type="number" id="bp1x" value="{{ config.get('board_p1x', 195) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                    <input type="number" id="bp1y" value="{{ config.get('board_p1y', 18) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                </div>
+            </div>
+            <div class="dim-box">
+                <div class="dim-label">P3 — Bottom-Left</div>
+                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
+                    <input type="number" id="bp3x" value="{{ config.get('board_p3x', 50) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                    <input type="number" id="bp3y" value="{{ config.get('board_p3y', 160) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                </div>
+            </div>
+            <div class="dim-box">
+                <div class="dim-label">P2 — Bottom-Right</div>
+                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
+                    <input type="number" id="bp2x" value="{{ config.get('board_p2x', 195) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                    <input type="number" id="bp2y" value="{{ config.get('board_p2y', 160) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
+                </div>
+            </div>
+        </div>
+        <div style="text-align:center;margin-bottom:10px;">
+            <button class="cal-btn" onclick="doSaveCrop()">Save Corners</button>
+        </div>
+        <div class="cal-row" style="flex-wrap:wrap;gap:8px;margin-top:4px;">
+            <label>Pixels/mm:</label>
+            <input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:90px;">
+            <span style="color:#888;font-size:11px;">current: {{ config.get('pixels_per_mm', 0.1644) }}</span>
+        </div>
+        <div class="cal-info">Image is 320x240. Each input pair is x, y. Layout matches plywood orientation.</div>
+        <div class="cal-result" id="cropResult"></div>
     </div>
 
     {% if not measurements %}
@@ -337,6 +478,31 @@ PAGE_TEMPLATE = """
                 <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} | ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
                 {% else %}
                 <div class="no-detect">No object detected</div>
+                <div class="dims">
+                    <div class="dim-box">
+                        <div class="dim-label">Weight</div>
+                        <div class="dim-value wt">{{ "%.1f"|format(m.weight_g) }} g</div>
+                        <div class="dim-sub">{{ "%.3f"|format(m.weight_g / 1000) }} kg</div>
+                    </div>
+                    <div class="dim-box">
+                        <div class="dim-label">Height</div>
+                        {% if m.get('height_cm', 0) > 0 %}
+                        <div class="dim-value ht">{{ "%.2f"|format(m.get('height_cm', 0)) }} cm</div>
+                        <div class="dim-sub">{{ "%.1f"|format(m.get('height_cm', 0) * 10) }} mm</div>
+                        {% else %}
+                        <div class="dim-value ht">N/A</div>
+                        {% endif %}
+                    </div>
+                    <div class="dim-box">
+                        <div class="dim-label">Ultrasonic</div>
+                        {% if m.get('object_cm', -1) > 0 %}
+                        <div class="dim-value d">{{ "%.2f"|format(m.get('object_cm', 0)) }} cm</div>
+                        <div class="dim-sub">baseline: {{ "%.2f"|format(m.get('baseline_cm', 0)) }} cm</div>
+                        {% else %}
+                        <div class="dim-value d">N/A</div>
+                        {% endif %}
+                    </div>
+                </div>
                 {% endif %}
             </div>
         </div>
@@ -351,12 +517,17 @@ PAGE_TEMPLATE = """
         btn.textContent = '...';
         result.style.display = 'none';
         try {
-            const resp = await fetch('/api/trigger', {method: 'POST'});
+            const tareFirst = document.getElementById('tareFirst').checked;
+            const resp = await fetch('/api/trigger', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tare_first: tareFirst})
+            });
             const data = await resp.json();
             result.style.display = 'block';
             if (resp.ok) {
                 result.style.color = '#4fc3f7';
-                result.textContent = 'Triggered via ' + data.mode + '. Measurement in progress...';
+                result.textContent = (tareFirst ? 'Taring then measuring...' : 'Measuring...') + ' (via ' + data.mode + ')';
             } else {
                 result.style.color = '#ef5350';
                 result.textContent = 'Error: ' + data.message;
@@ -370,44 +541,86 @@ PAGE_TEMPLATE = """
         btn.textContent = '\u25b6 Measure Now';
     }
 
-    async function doCalibrate() {
-        const input = document.getElementById('knownWeight');
-        const btn = document.getElementById('calBtn');
-        const result = document.getElementById('calResult');
-        const weight = parseFloat(input.value);
-        if (!weight || weight <= 0) {
-            result.style.display = 'block';
-            result.style.color = '#ef5350';
-            result.textContent = 'Enter a valid weight in grams.';
-            return;
+    async function doSetTriggerMode(mode) {
+        const status = document.getElementById('modeResult');
+        status.textContent = 'Saving...';
+        const resp = await fetch('/api/set_trigger_mode', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({trigger_mode: mode})
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            status.style.color = '#81c784';
+            status.textContent = 'Saved. Takes effect on next trigger.';
+        } else {
+            status.style.color = '#ef5350';
+            status.textContent = 'Error: ' + data.message;
         }
-        btn.disabled = true;
-        btn.textContent = '...';
-        try {
-            const resp = await fetch('/api/calibrate', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({known_weight_g: weight})
-            });
-            const data = await resp.json();
-            if (resp.ok) {
-                result.style.display = 'block';
-                result.style.color = '#4fc3f7';
-                result.textContent = 'New cal_factor: ' + data.cal_factor + ' (raw_diff: ' + data.raw_diff + ')';
-                document.getElementById('currentCal').textContent = data.cal_factor;
-            } else {
-                result.style.display = 'block';
-                result.style.color = '#ef5350';
-                result.textContent = 'Error: ' + data.message;
-            }
-        } catch (e) {
-            result.style.display = 'block';
-            result.style.color = '#ef5350';
-            result.textContent = 'Request failed: ' + e.message;
-        }
-        btn.disabled = false;
-        btn.textContent = 'Calibrate';
     }
+
+    async function doSetRawCapture(enabled) {
+        await fetch('/api/set_board_crop', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({raw_capture: enabled})
+        });
+    }
+
+    async function doSaveCrop() {
+        const result = document.getElementById('cropResult');
+        const body = {
+            board_p0x: parseInt(document.getElementById('bp0x').value),
+            board_p0y: parseInt(document.getElementById('bp0y').value),
+            board_p1x: parseInt(document.getElementById('bp1x').value),
+            board_p1y: parseInt(document.getElementById('bp1y').value),
+            board_p2x: parseInt(document.getElementById('bp2x').value),
+            board_p2y: parseInt(document.getElementById('bp2y').value),
+            board_p3x: parseInt(document.getElementById('bp3x').value),
+            board_p3y: parseInt(document.getElementById('bp3y').value),
+            pixels_per_mm: parseFloat(document.getElementById('bppmm').value),
+        };
+        const resp = await fetch('/api/set_board_crop', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await resp.json();
+        result.style.display = 'block';
+        if (resp.ok) {
+            result.style.color = '#4fc3f7';
+            result.textContent = `Saved 4 corners. Takes effect on next trigger.`;
+        } else {
+            result.style.color = '#ef5350';
+            result.textContent = 'Error: ' + data.message;
+        }
+    }
+
+    async function doSetBaseline() {
+        const input = document.getElementById('baselineInput');
+        const result = document.getElementById('baselineResult');
+        const val = parseFloat(input.value);
+        if (!val || val <= 0) {
+            result.style.display = 'block'; result.style.color = '#ef5350';
+            result.textContent = 'Enter a valid distance in cm.'; return;
+        }
+        const resp = await fetch('/api/set_baseline', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({baseline_cm: val})
+        });
+        const data = await resp.json();
+        result.style.display = 'block';
+        if (resp.ok) {
+            result.style.color = '#4fc3f7';
+            result.textContent = 'Saved! Takes effect on next trigger.';
+            document.getElementById('currentBaseline').textContent = data.baseline_cm;
+        } else {
+            result.style.color = '#ef5350';
+            result.textContent = 'Error: ' + data.message;
+        }
+    }
+
     </script>
 </body>
 </html>
@@ -442,6 +655,7 @@ def tcp_server_thread():
 if __name__ == "__main__":
     t = threading.Thread(target=tcp_server_thread, daemon=True)
     t.start()
+
 
     hostname = sock_lib.gethostname()
     local_ip = sock_lib.gethostbyname(hostname)
