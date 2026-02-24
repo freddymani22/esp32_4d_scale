@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "ultrasonic.h"
 
 // ============== WIFI CONFIGURATION ==============
 #define WIFI_SSID       "VithamasTech_Gnd Flr Hall_1"
@@ -262,92 +263,44 @@ static float hx711_read_grams(void)
 
 // ============== ULTRASONIC SENSOR ==============
 
-static void ultrasonic_init(void)
+static ultrasonic_sensor_t s_ultrasonic = {
+    .trigger_pin = US_TRIG_PIN,
+    .echo_pin    = US_ECHO_PIN,
+};
+
+static void app_ultrasonic_init(void)
 {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << US_TRIG_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-
-    io_conf.pin_bit_mask = (1ULL << US_ECHO_PIN);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;  // Pull ECHO LOW when idle
-    gpio_config(&io_conf);
-
-    gpio_set_level(US_TRIG_PIN, 0);
+    esp_err_t err = ultrasonic_init(&s_ultrasonic);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Ultrasonic init failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Ultrasonic sensor initialized (TRIG=GPIO%d, ECHO=GPIO%d)",
+                 US_TRIG_PIN, US_ECHO_PIN);
+    }
     vTaskDelay(pdMS_TO_TICKS(100));  // Let sensor settle
-    ESP_LOGI(TAG, "Ultrasonic sensor initialized (TRIG=GPIO%d, ECHO=GPIO%d)", US_TRIG_PIN, US_ECHO_PIN);
 }
 
-static portMUX_TYPE us_mux = portMUX_INITIALIZER_UNLOCKED;
-
-static float ultrasonic_read_cm(void)
-{
-    // Wait for ECHO to be LOW before triggering (clear any leftover echo)
-    int64_t wait_low = esp_timer_get_time() + 50000;  // 50ms max wait
-    while (gpio_get_level(US_ECHO_PIN) == 1) {
-        if (esp_timer_get_time() > wait_low) {
-            ESP_LOGW(TAG, "  ECHO stuck HIGH before trigger — skipping");
-            return -1.0f;
-        }
-    }
-
-    portENTER_CRITICAL(&us_mux);
-
-    // Send 10us trigger pulse
-    gpio_set_level(US_TRIG_PIN, 0);
-    ets_delay_us(10);
-    gpio_set_level(US_TRIG_PIN, 1);
-    ets_delay_us(20);
-    gpio_set_level(US_TRIG_PIN, 0);
-
-    // Wait for ECHO to go HIGH (timeout ~30ms)
-    int64_t timeout = esp_timer_get_time() + 30000;
-    while (gpio_get_level(US_ECHO_PIN) == 0) {
-        if (esp_timer_get_time() > timeout) {
-            portEXIT_CRITICAL(&us_mux);
-            ESP_LOGW(TAG, "  ECHO never went HIGH — no response from sensor");
-            return -1.0f;
-        }
-    }
-
-    // Measure how long ECHO stays HIGH
-    int64_t start = esp_timer_get_time();
-    timeout = start + 30000;
-    while (gpio_get_level(US_ECHO_PIN) == 1) {
-        if (esp_timer_get_time() > timeout) {
-            portEXIT_CRITICAL(&us_mux);
-            ESP_LOGW(TAG, "  ECHO stayed HIGH too long — object too far or no object");
-            return -1.0f;
-        }
-    }
-    int64_t duration_us = esp_timer_get_time() - start;
-
-    portEXIT_CRITICAL(&us_mux);
-    // === END CRITICAL SECTION ===
-
-    // Distance = (duration * speed_of_sound) / 2
-    // Speed of sound = 331.3 + (0.606 * temp_C) m/s => cm/us
-    float speed_cm_per_us = (331.3f + 0.606f * ROOM_TEMP_C) / 10000.0f;
-    float distance_cm = (float)duration_us * speed_cm_per_us / 2.0f * US_CAL_FACTOR;
-    ESP_LOGI(TAG, "  US: duration=%lld us, distance=%.2f cm", duration_us, distance_cm);
-    return distance_cm;
-}
-
-// Average multiple readings, discard outliers
-static float ultrasonic_measure(void)
+// Take up to 5 readings, average the valid ones
+static float app_ultrasonic_measure(void)
 {
     float readings[5];
     int valid = 0;
 
     for (int i = 0; i < 5; i++) {
-        float d = ultrasonic_read_cm();
-        if (d > 0.0f && d < 400.0f) {
-            readings[valid++] = d;
+        float distance_m = 0;
+        esp_err_t err = ultrasonic_measure(&s_ultrasonic, 400, &distance_m);
+        if (err == ESP_OK) {
+            float distance_cm = distance_m * 100.0f;
+            ESP_LOGI(TAG, "  US[%d]: %.2f cm", i, distance_cm);
+            if (distance_cm > 0.0f && distance_cm < 400.0f) {
+                readings[valid++] = distance_cm;
+            }
+        } else if (err == ESP_ERR_ULTRASONIC_PING_TIMEOUT) {
+            ESP_LOGW(TAG, "  US[%d]: ECHO never went HIGH — no response from sensor", i);
+        } else if (err == ESP_ERR_ULTRASONIC_ECHO_TIMEOUT) {
+            ESP_LOGW(TAG, "  US[%d]: object too far or no object", i);
+        } else {
+            ESP_LOGW(TAG, "  US[%d]: error %s", i, esp_err_to_name(err));
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -358,10 +311,10 @@ static float ultrasonic_measure(void)
     }
 
     float sum = 0;
-    for (int i = 0; i < valid; i++) {
-        sum += readings[i];
-    }
-    return sum / valid;
+    for (int i = 0; i < valid; i++) sum += readings[i];
+    float avg = sum / valid;
+    ESP_LOGI(TAG, "  US avg: %.2f cm (%d/%d valid)", avg, valid, 5);
+    return avg;
 }
 
 // ============== WIFI ==============
@@ -1305,11 +1258,11 @@ void app_main(void)
     hx711_init();
     hx711_read_tare();
 
-    ultrasonic_init();
+    app_ultrasonic_init();
 
     // Measure baseline distance to empty board (once at boot)
     ESP_LOGI(TAG, ">>> Measuring baseline (empty board)...");
-    g_baseline_cm = ultrasonic_measure();
+    g_baseline_cm = app_ultrasonic_measure();
     if (g_baseline_cm <= 0) {
         ESP_LOGW(TAG, "Baseline measurement failed, using fixed value %.2f cm", FIXED_BASELINE_CM);
         g_baseline_cm = FIXED_BASELINE_CM;
@@ -1351,7 +1304,7 @@ void app_main(void)
 
         // Ultrasonic height (baseline was captured at boot)
         ESP_LOGI(TAG, ">>> Measuring object distance (baseline=%.2f cm)...", g_baseline_cm);
-        g_object_cm = ultrasonic_measure();
+        g_object_cm = app_ultrasonic_measure();
         if (g_object_cm > 0 && g_baseline_cm > 0) {
             g_object_height_cm = g_baseline_cm - g_object_cm;
             if (g_object_height_cm < 0) g_object_height_cm = 0;
