@@ -380,6 +380,21 @@ PAGE_TEMPLATE = """
     </div>
 
     <div class="cal-section">
+        <h2>Weight Calibration</h2>
+        <div class="cal-info" style="margin-bottom:10px;">Place a known weight on the board, trigger a measurement, then enter the actual weight below and click Calibrate.</div>
+        <div class="cal-row" style="flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+            <label>Known weight (g):</label>
+            <input type="number" id="knownWeight" placeholder="e.g. 500" step="0.1" style="width:100px;">
+            <button class="cal-btn" onclick="doWeightCalibrate()">Calibrate</button>
+        </div>
+        <div class="cal-row" style="flex-wrap:wrap;gap:8px;">
+            <label>Current cal_factor:</label>
+            <span style="color:#4fc3f7;font-weight:bold;" id="calFactorDisplay">{{ config.get('cal_factor', 27.93) }}</span>
+        </div>
+        <div class="cal-result" id="weightCalResult"></div>
+    </div>
+
+    <div class="cal-section">
         <h2>Board Calibration</h2>
         <div class="cal-info" style="margin-bottom:10px;">Enable "Raw capture" above, trigger a shot, run <code>find_coords.py</code> on the image and click all 4 plywood corners.</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
@@ -565,6 +580,39 @@ PAGE_TEMPLATE = """
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({raw_capture: enabled})
         });
+    }
+
+    async function doWeightCalibrate() {
+        const result = document.getElementById('weightCalResult');
+        const known = parseFloat(document.getElementById('knownWeight').value);
+        if (!known || known <= 0) {
+            result.style.display = 'block';
+            result.style.color = '#f44';
+            result.textContent = 'Enter a valid known weight in grams.';
+            return;
+        }
+        result.style.display = 'block';
+        result.style.color = '#aaa';
+        result.textContent = 'Calibrating...';
+        try {
+            const resp = await fetch('/api/calibrate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({known_weight_g: known})
+            });
+            const data = await resp.json();
+            if (data.status === 'ok') {
+                result.style.color = '#4caf50';
+                result.textContent = `Calibrated! New cal_factor = ${data.cal_factor} (raw_diff = ${data.raw_diff})`;
+                document.getElementById('calFactorDisplay').textContent = data.cal_factor;
+            } else {
+                result.style.color = '#f44';
+                result.textContent = `Error: ${data.message}`;
+            }
+        } catch(e) {
+            result.style.color = '#f44';
+            result.textContent = 'Request failed.';
+        }
     }
 
     async function doSaveCrop() {
