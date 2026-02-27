@@ -202,41 +202,62 @@ static int cmp_int32(const void *a, const void *b)
     return (va > vb) - (va < vb);
 }
 
-// Read N samples, discard zeros, sort, trim outer 25% (IQR), average the middle 50%
+// Read 5 samples, use median as reference, accept readings within 80%-120% of median.
+// Retries up to 3 times (fresh 5 readings each time) if no valid readings found.
 static int32_t hx711_read_filtered_into(const char *label, int32_t *out_readings)
 {
-    int32_t readings[HX711_NUM_READINGS];
-    int valid = 0;
+    int32_t result = 0;
 
-    for (int i = 0; i < HX711_NUM_READINGS; i++) {
-        int32_t raw = hx711_read_raw();
-        ESP_LOGI(TAG, "  %s[%d]: %ld", label, i + 1, (long)raw);
-        out_readings[i] = raw;
-        if (raw != 0) {
-            readings[valid++] = raw;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "  %s retry %d/3...", label, attempt + 1);
         }
-        vTaskDelay(pdMS_TO_TICKS(200));
+
+        // Take 5 fresh readings
+        int32_t readings[HX711_NUM_READINGS];
+        int count = 0;
+        for (int i = 0; i < HX711_NUM_READINGS; i++) {
+            int32_t raw = hx711_read_raw();
+            ESP_LOGI(TAG, "  %s[%d]: %ld", label, i + 1, (long)raw);
+            out_readings[i] = raw;
+            readings[i] = raw;
+            count++;
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        // Sort to find median
+        qsort(readings, count, sizeof(int32_t), cmp_int32);
+        int32_t median = readings[count / 2];
+
+        // Accept readings within 80%-120% of median
+        int64_t sum = 0;
+        int valid = 0;
+        for (int i = 0; i < HX711_NUM_READINGS; i++) {
+            int32_t v = out_readings[i];
+            if (v >= (int32_t)(median * 0.8f) && v <= (int32_t)(median * 1.2f)) {
+                sum += v;
+                valid++;
+            } else {
+                ESP_LOGW(TAG, "  %s[*]: %ld discarded (median=%ld)", label, (long)v, (long)median);
+            }
+        }
+
+        if (valid > 0) {
+            result = (int32_t)(sum / valid);
+            ESP_LOGI(TAG, "  %s result: %ld (avg of %d/5 valid, median=%ld)",
+                     label, (long)result, valid, (long)median);
+            return result;
+        }
+
+        ESP_LOGW(TAG, "  %s: all readings invalid, retrying...", label);
     }
 
-    if (valid == 0) return 0;
-
-  //  qsort(readings, valid, sizeof(int32_t), cmp_int32);
-
-    // Trim outer 25% on each side, average the middle 50%
-    // int trim = valid / 4;
-    // int start = trim;
-    // int end = valid - trim;
-    // if (end <= start) { start = 0; end = valid; }  // fallback if too few
-
-    int64_t sum = 0;
-    for (int i = 0; i < valid; i++) {
-        sum += readings[i];
-    }
-    int32_t result = (int32_t)(sum / valid);
-
-    ESP_LOGI(TAG, "  %s result: %ld (trimmed mean of %d valid)",
-             label, (long)result,  valid);
-    return result;
+    // After 3 failed attempts, return last median as fallback
+    ESP_LOGE(TAG, "  %s: 3 attempts failed, using last median as fallback", label);
+    int32_t fallback[HX711_NUM_READINGS];
+    memcpy(fallback, out_readings, sizeof(fallback));
+    qsort(fallback, HX711_NUM_READINGS, sizeof(int32_t), cmp_int32);
+    return fallback[HX711_NUM_READINGS / 2];
 }
 
 static int32_t hx711_raw_avg = 0;  // stored for upload to server
