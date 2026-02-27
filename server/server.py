@@ -194,7 +194,7 @@ def delete_measurement():
         return {"status": "error", "message": "missing filename"}, 400
     filename = os.path.basename(body["filename"])  # prevent path traversal
     measurements = load_measurements()
-    measurements = [m for m in measurements if m.get("filename") != filename]
+    measurements = [m for m in measurements if m.get("image") != filename]
     save_measurements(measurements)
     if filename:
         img_path = os.path.join(UPLOAD_DIR, filename)
@@ -542,7 +542,7 @@ PAGE_TEMPLATE = """
                 {% if m.get('weight_readings') %}<div class="raw-info">weight readings: {{ m.weight_readings }}</div>{% endif %}
                 {% endif %}
                 <div style="text-align:right;margin-top:6px;">
-                    <button onclick="doDelete('{{ m.filename }}')" style="background:#c0392b;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px;">Delete</button>
+                    <button onclick="doDelete('{{ m.image }}')" style="background:#c0392b;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px;">Delete</button>
                 </div>
             </div>
         </div>
