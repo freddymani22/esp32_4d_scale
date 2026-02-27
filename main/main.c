@@ -25,9 +25,10 @@
 // ============== WIFI CONFIGURATION ==============
 #define WIFI_SSID       "VithamasTech_Gnd Flr Hall_1"
 #define WIFI_PASS       "#Newbusiness$"
-#define SERVER_IP       "216.48.183.67"
-#define SERVER_PORT     8080
+#define SERVER_IP       "3dscale.biggworks.com"
+#define SERVER_PORT     80
 #define SERVER_TCP_PORT  9000
+#define SERVER_PATH_PREFIX "/server"
 #define WIFI_MAX_RETRY  10
 #define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
@@ -238,6 +239,10 @@ static int32_t hx711_read_filtered_into(const char *label, int32_t *out_readings
     return result;
 }
 
+static int32_t hx711_raw_avg = 0;  // stored for upload to server
+static int32_t hx711_raw_readings[HX711_NUM_READINGS] = {0};  // individual readings
+static int32_t hx711_tare_readings[HX711_NUM_READINGS] = {0}; // individual tare readings
+
 static void hx711_read_tare(void)
 {
     ESP_LOGI(TAG, ">>> Tare in 4 seconds — keep board empty...");
@@ -249,9 +254,6 @@ static void hx711_read_tare(void)
     hx711_tare = hx711_read_filtered_into("Tare", hx711_tare_readings);
 }
 
-static int32_t hx711_raw_avg = 0;  // stored for upload to server
-static int32_t hx711_raw_readings[HX711_NUM_READINGS] = {0};  // individual readings
-static int32_t hx711_tare_readings[HX711_NUM_READINGS] = {0}; // individual tare readings
 static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
@@ -477,7 +479,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 static void fetch_config(void)
 {
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/api/config", SERVER_IP, SERVER_PORT);
+    snprintf(url, sizeof(url), "http://%s:%d%s/api/config", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
 
     char body[256] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
@@ -600,12 +602,12 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
 {
     char url[768];
     snprintf(url, sizeof(url),
-             "http://%s:%d/upload?valid=%d&length_mm=%.1f&width_mm=%.1f"
+             "http://%s:%d%s/upload?valid=%d&length_mm=%.1f&width_mm=%.1f"
              "&length_px=%.1f&width_px=%.1f&angle=%.1f&weight_g=%.1f"
              "&raw_tare=%ld&raw_avg=%ld"
              "&baseline_cm=%.2f&object_cm=%.2f&height_cm=%.2f&pixels_per_mm=%.4f"
              "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld",
-             SERVER_IP, SERVER_PORT,
+             SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX,
              rect->valid ? 1 : 0,
              rect->valid ? rect->length_mm : 0.0f,
              rect->valid ? rect->width_mm : 0.0f,
@@ -1151,7 +1153,7 @@ cleanup:
 static bool wait_for_trigger_poll(void)
 {
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/api/wait", SERVER_IP, SERVER_PORT);
+    snprintf(url, sizeof(url), "http://%s:%d%s/api/wait", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
 
     char body[64] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
