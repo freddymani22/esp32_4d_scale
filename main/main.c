@@ -143,17 +143,17 @@ static int32_t hx711_read_raw(void)
     // taskENTER_CRITICAL(&mux);
     for (int i = 0; i < 24; i++) {
         gpio_set_level(HX711_SCK_PIN, 1);
-        ets_delay_us(10);
+        ets_delay_us(30);
         data = (data << 1) | gpio_get_level(HX711_DOUT_PIN);
         gpio_set_level(HX711_SCK_PIN, 0);
-        ets_delay_us(10);
+        ets_delay_us(30);
     }
 
     // 25th pulse: set gain to 128 for channel A
     gpio_set_level(HX711_SCK_PIN, 1);
-    ets_delay_us(10);
+    ets_delay_us(30);
     gpio_set_level(HX711_SCK_PIN, 0);
-    ets_delay_us(10);
+    ets_delay_us(30);
     // taskEXIT_CRITICAL(&mux);
 
     // Convert from 24-bit two's complement
@@ -332,7 +332,7 @@ static float ultrasonic_read_cm(void)
 
     // Send 10us trigger pulse
     gpio_set_level(US_TRIG_PIN, 0);
-    ets_delay_us(10);
+    ets_delay_us(30);
     gpio_set_level(US_TRIG_PIN, 1);
     ets_delay_us(20);
     gpio_set_level(US_TRIG_PIN, 0);
