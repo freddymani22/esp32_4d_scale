@@ -242,14 +242,14 @@ static int32_t hx711_read_filtered_into(const char *label, int32_t *out_readings
             }
         }
 
-        if (valid > 0) {
+        if (valid >= 3) {
             result = (int32_t)(sum / valid);
             ESP_LOGI(TAG, "  %s result: %ld (avg of %d/5 valid, median=%ld)",
                      label, (long)result, valid, (long)median);
             return result;
         }
 
-        ESP_LOGW(TAG, "  %s: all readings invalid, retrying...", label);
+        ESP_LOGW(TAG, "  %s: only %d/5 valid, retrying...", label, valid);
     }
 
     // After 3 failed attempts, return last median as fallback
