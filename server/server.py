@@ -87,6 +87,8 @@ def upload():
         "weight_g": float(request.args.get("weight_g", 0)),
         "raw_tare": int(request.args.get("raw_tare", 0)),
         "raw_avg": int(request.args.get("raw_avg", 0)),
+        "tare_readings": request.args.get("tare_r", ""),
+        "weight_readings": request.args.get("weight_r", ""),
         "baseline_cm": float(request.args.get("baseline_cm", -1)),
         "object_cm": float(request.args.get("object_cm", -1)),
         "height_cm": float(request.args.get("height_cm", 0)),
@@ -183,6 +185,21 @@ def set_board_crop():
                "board_p2x","board_p2y","board_p3x","board_p3y","raw_capture","pixels_per_mm"]
     return {"status": "ok", "config": {k: cfg[k] for k in pt_keys if k in cfg}}
 
+
+# Delete a measurement and its image
+@app.route("/api/delete", methods=["POST"])
+def delete_measurement():
+    body = request.get_json()
+    if not body or "filename" not in body:
+        return {"status": "error", "message": "missing filename"}, 400
+    filename = os.path.basename(body["filename"])  # prevent path traversal
+    measurements = load_measurements()
+    measurements = [m for m in measurements if m.get("filename") != filename]
+    save_measurements(measurements)
+    img_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(img_path):
+        os.remove(img_path)
+    return {"status": "ok"}
 
 # Save trigger mode
 @app.route("/api/set_trigger_mode", methods=["POST"])
@@ -491,6 +508,8 @@ PAGE_TEMPLATE = """
                     </div>
                 </div>
                 <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} | ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
+                {% if m.get('tare_readings') %}<div class="raw-info">tare readings: {{ m.tare_readings }}</div>{% endif %}
+                {% if m.get('weight_readings') %}<div class="raw-info">weight readings: {{ m.weight_readings }}</div>{% endif %}
                 {% else %}
                 <div class="no-detect">No object detected</div>
                 <div class="dims">
@@ -518,13 +537,30 @@ PAGE_TEMPLATE = """
                         {% endif %}
                     </div>
                 </div>
+                {% if m.get('tare_readings') %}<div class="raw-info">tare readings: {{ m.tare_readings }}</div>{% endif %}
+                {% if m.get('weight_readings') %}<div class="raw-info">weight readings: {{ m.weight_readings }}</div>{% endif %}
                 {% endif %}
+                <div style="text-align:right;margin-top:6px;">
+                    <button onclick="doDelete('{{ m.filename }}')" style="background:#c0392b;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px;">Delete</button>
+                </div>
             </div>
         </div>
     {% endfor %}
     </div>
 
     <script>
+    async function doDelete(filename) {
+        if (!confirm('Delete this measurement and image?')) return;
+        const resp = await fetch('/api/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({filename: filename})
+        });
+        const data = await resp.json();
+        if (data.status === 'ok') location.reload();
+        else alert('Delete failed: ' + data.message);
+    }
+
     async function doTrigger() {
         const btn = document.getElementById('triggerBtn');
         const result = document.getElementById('triggerResult');

@@ -25,7 +25,7 @@
 // ============== WIFI CONFIGURATION ==============
 #define WIFI_SSID       "VithamasTech_Gnd Flr Hall_1"
 #define WIFI_PASS       "#Newbusiness$"
-#define SERVER_IP       "192.168.0.243"
+#define SERVER_IP       "216.48.183.67"
 #define SERVER_PORT     8080
 #define SERVER_TCP_PORT  9000
 #define WIFI_MAX_RETRY  10
@@ -123,9 +123,9 @@ static bool hx711_is_ready(void)
 static int32_t hx711_read_raw(void)
 {
     // Wait for HX711 to be ready (DOUT goes LOW)
-    int timeout = 1000;
+    int timeout = 1000000;
     while (!hx711_is_ready() && timeout > 0) {
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // vTaskDelay(pdMS_TO_TICKS(1));
         timeout--;
     }
 
@@ -134,24 +134,26 @@ static int32_t hx711_read_raw(void)
         return 0;
     }
 
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     // Read 24 bits — disable interrupts to prevent bit-bang corruption
     int32_t data = 0;
-    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-    taskENTER_CRITICAL(&mux);
+    // portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    // taskENTER_CRITICAL(&mux);
     for (int i = 0; i < 24; i++) {
         gpio_set_level(HX711_SCK_PIN, 1);
-        ets_delay_us(1);
+        ets_delay_us(10);
         data = (data << 1) | gpio_get_level(HX711_DOUT_PIN);
         gpio_set_level(HX711_SCK_PIN, 0);
-        ets_delay_us(1);
+        ets_delay_us(10);
     }
 
-    // 25th pulse: set gain to 128 for channel A (default)
+    // 25th pulse: set gain to 128 for channel A
     gpio_set_level(HX711_SCK_PIN, 1);
-    ets_delay_us(1);
+    ets_delay_us(10);
     gpio_set_level(HX711_SCK_PIN, 0);
-    ets_delay_us(1);
-    taskEXIT_CRITICAL(&mux);
+    ets_delay_us(10);
+    // taskEXIT_CRITICAL(&mux);
 
     // Convert from 24-bit two's complement
     if (data & 0x800000) {
@@ -200,7 +202,7 @@ static int cmp_int32(const void *a, const void *b)
 }
 
 // Read N samples, discard zeros, sort, trim outer 25% (IQR), average the middle 50%
-static int32_t hx711_read_filtered(const char *label)
+static int32_t hx711_read_filtered_into(const char *label, int32_t *out_readings)
 {
     int32_t readings[HX711_NUM_READINGS];
     int valid = 0;
@@ -208,6 +210,7 @@ static int32_t hx711_read_filtered(const char *label)
     for (int i = 0; i < HX711_NUM_READINGS; i++) {
         int32_t raw = hx711_read_raw();
         ESP_LOGI(TAG, "  %s[%d]: %ld", label, i + 1, (long)raw);
+        out_readings[i] = raw;
         if (raw != 0) {
             readings[valid++] = raw;
         }
@@ -216,33 +219,39 @@ static int32_t hx711_read_filtered(const char *label)
 
     if (valid == 0) return 0;
 
-    qsort(readings, valid, sizeof(int32_t), cmp_int32);
+  //  qsort(readings, valid, sizeof(int32_t), cmp_int32);
 
     // Trim outer 25% on each side, average the middle 50%
-    int trim = valid / 4;
-    int start = trim;
-    int end = valid - trim;
-    if (end <= start) { start = 0; end = valid; }  // fallback if too few
+    // int trim = valid / 4;
+    // int start = trim;
+    // int end = valid - trim;
+    // if (end <= start) { start = 0; end = valid; }  // fallback if too few
 
     int64_t sum = 0;
-    for (int i = start; i < end; i++) {
+    for (int i = 0; i < valid; i++) {
         sum += readings[i];
     }
-    int32_t result = (int32_t)(sum / (end - start));
+    int32_t result = (int32_t)(sum / valid);
 
-    ESP_LOGI(TAG, "  %s result: %ld (trimmed mean of [%d..%d] from %d valid, range: %ld to %ld)",
-             label, (long)result, start, end - 1, valid,
-             (long)readings[0], (long)readings[valid - 1]);
+    ESP_LOGI(TAG, "  %s result: %ld (trimmed mean of %d valid)",
+             label, (long)result,  valid);
     return result;
 }
 
 static void hx711_read_tare(void)
 {
+    ESP_LOGI(TAG, ">>> Tare in 4 seconds — keep board empty...");
+    for (int i = 4; i > 0; i--) {
+        ESP_LOGI(TAG, ">>>   %d...", i);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     ESP_LOGI(TAG, ">>> Reading tare (empty plywood)...");
-    hx711_tare = hx711_read_filtered("Tare");
+    hx711_tare = hx711_read_filtered_into("Tare", hx711_tare_readings);
 }
 
 static int32_t hx711_raw_avg = 0;  // stored for upload to server
+static int32_t hx711_raw_readings[HX711_NUM_READINGS] = {0};  // individual readings
+static int32_t hx711_tare_readings[HX711_NUM_READINGS] = {0}; // individual tare readings
 static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
@@ -250,7 +259,7 @@ static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
 
 static float hx711_read_grams(void)
 {
-    int32_t filtered = hx711_read_filtered("Weight");
+    int32_t filtered = hx711_read_filtered_into("Weight", hx711_raw_readings);
     hx711_raw_avg = filtered;
     int32_t diff = filtered - hx711_tare;
     float grams = fabsf((float)diff) / hx711_cal_factor;
@@ -589,12 +598,13 @@ static void fetch_config(void)
 static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
                           min_area_rect_t *rect, float weight_g)
 {
-    char url[512];
+    char url[768];
     snprintf(url, sizeof(url),
              "http://%s:%d/upload?valid=%d&length_mm=%.1f&width_mm=%.1f"
              "&length_px=%.1f&width_px=%.1f&angle=%.1f&weight_g=%.1f"
              "&raw_tare=%ld&raw_avg=%ld"
-             "&baseline_cm=%.2f&object_cm=%.2f&height_cm=%.2f&pixels_per_mm=%.4f",
+             "&baseline_cm=%.2f&object_cm=%.2f&height_cm=%.2f&pixels_per_mm=%.4f"
+             "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld",
              SERVER_IP, SERVER_PORT,
              rect->valid ? 1 : 0,
              rect->valid ? rect->length_mm : 0.0f,
@@ -604,7 +614,13 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
              rect->valid ? rect->angle : 0.0f,
              weight_g,
              (long)hx711_tare, (long)hx711_raw_avg,
-             g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm);
+             g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm,
+             (long)hx711_tare_readings[0], (long)hx711_tare_readings[1],
+             (long)hx711_tare_readings[2], (long)hx711_tare_readings[3],
+             (long)hx711_tare_readings[4],
+             (long)hx711_raw_readings[0], (long)hx711_raw_readings[1],
+             (long)hx711_raw_readings[2], (long)hx711_raw_readings[3],
+             (long)hx711_raw_readings[4]);
 
     ESP_LOGI(TAG, "Upload params: baseline=%.2f cm, object=%.2f cm, object_height=%.2f cm, ppmm=%.4f",
              g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm);
