@@ -9,4 +9,6 @@ services:
       - "9000:9000"
     volumes:
       - ./uploads:/app/uploads
+    environment:
+      - TZ=Asia/Kolkata
     restart: unless-stopped
