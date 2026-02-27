@@ -549,7 +549,7 @@ PAGE_TEMPLATE = """
     </div>
 
     <script>
-    const API_BASE = '/server';
+    const API_BASE = '';
 
     async function doDelete(filename) {
         if (!confirm('Delete this measurement and image?')) return;
