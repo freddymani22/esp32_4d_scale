@@ -196,9 +196,10 @@ def delete_measurement():
     measurements = load_measurements()
     measurements = [m for m in measurements if m.get("filename") != filename]
     save_measurements(measurements)
-    img_path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(img_path):
-        os.remove(img_path)
+    if filename:
+        img_path = os.path.join(UPLOAD_DIR, filename)
+        if os.path.exists(img_path) and os.path.isfile(img_path):
+            os.remove(img_path)
     return {"status": "ok"}
 
 # Save trigger mode
