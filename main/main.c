@@ -28,7 +28,7 @@
 #define SERVER_IP       "3dscale.biggworks.com"
 #define SERVER_PORT     80
 #define SERVER_TCP_PORT  9000
-#define SERVER_PATH_PREFIX "/server"
+#define SERVER_PATH_PREFIX ""
 #define WIFI_MAX_RETRY  10
 #define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
