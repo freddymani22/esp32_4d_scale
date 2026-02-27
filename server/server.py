@@ -549,9 +549,11 @@ PAGE_TEMPLATE = """
     </div>
 
     <script>
+    const API_BASE = '/server';
+
     async function doDelete(filename) {
         if (!confirm('Delete this measurement and image?')) return;
-        const resp = await fetch('/api/delete', {
+        const resp = await fetch(API_BASE + '/api/delete', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({filename: filename})
@@ -569,7 +571,7 @@ PAGE_TEMPLATE = """
         result.style.display = 'none';
         try {
             const tareFirst = document.getElementById('tareFirst').checked;
-            const resp = await fetch('/api/trigger', {
+            const resp = await fetch(API_BASE + '/api/trigger', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({tare_first: tareFirst})
@@ -595,7 +597,7 @@ PAGE_TEMPLATE = """
     async function doSetTriggerMode(mode) {
         const status = document.getElementById('modeResult');
         status.textContent = 'Saving...';
-        const resp = await fetch('/api/set_trigger_mode', {
+        const resp = await fetch(API_BASE + '/api/set_trigger_mode', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({trigger_mode: mode})
@@ -611,7 +613,7 @@ PAGE_TEMPLATE = """
     }
 
     async function doSetRawCapture(enabled) {
-        await fetch('/api/set_board_crop', {
+        await fetch(API_BASE + '/api/set_board_crop', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({raw_capture: enabled})
@@ -631,7 +633,7 @@ PAGE_TEMPLATE = """
         result.style.color = '#aaa';
         result.textContent = 'Calibrating...';
         try {
-            const resp = await fetch('/api/calibrate', {
+            const resp = await fetch(API_BASE + '/api/calibrate', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({known_weight_g: known})
@@ -664,7 +666,7 @@ PAGE_TEMPLATE = """
             board_p3y: parseInt(document.getElementById('bp3y').value),
             pixels_per_mm: parseFloat(document.getElementById('bppmm').value),
         };
-        const resp = await fetch('/api/set_board_crop', {
+        const resp = await fetch(API_BASE + '/api/set_board_crop', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body)
@@ -688,7 +690,7 @@ PAGE_TEMPLATE = """
             result.style.display = 'block'; result.style.color = '#ef5350';
             result.textContent = 'Enter a valid distance in cm.'; return;
         }
-        const resp = await fetch('/api/set_baseline', {
+        const resp = await fetch(API_BASE + '/api/set_baseline', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({baseline_cm: val})

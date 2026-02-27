@@ -479,7 +479,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 static void fetch_config(void)
 {
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d%s/api/config", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
+    snprintf(url, sizeof(url), "http://%s%s/api/config", SERVER_IP, SERVER_PATH_PREFIX);
 
     char body[256] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
@@ -602,12 +602,12 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
 {
     char url[768];
     snprintf(url, sizeof(url),
-             "http://%s:%d%s/upload?valid=%d&length_mm=%.1f&width_mm=%.1f"
+             "http://%s%s/upload?valid=%d&length_mm=%.1f&width_mm=%.1f"
              "&length_px=%.1f&width_px=%.1f&angle=%.1f&weight_g=%.1f"
              "&raw_tare=%ld&raw_avg=%ld"
              "&baseline_cm=%.2f&object_cm=%.2f&height_cm=%.2f&pixels_per_mm=%.4f"
              "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld",
-             SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX,
+             SERVER_IP, SERVER_PATH_PREFIX,
              rect->valid ? 1 : 0,
              rect->valid ? rect->length_mm : 0.0f,
              rect->valid ? rect->width_mm : 0.0f,
@@ -1153,7 +1153,7 @@ cleanup:
 static bool wait_for_trigger_poll(void)
 {
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d%s/api/wait", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
+    snprintf(url, sizeof(url), "http://%s%s/api/wait", SERVER_IP, SERVER_PATH_PREFIX);
 
     char body[64] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
