@@ -7,6 +7,7 @@ from datetime import datetime
 from PIL import Image
 
 trigger_event = threading.Event()
+poll_tare_first = False
 tcp_client_conn = None
 tcp_client_lock = threading.Lock()
 
@@ -242,6 +243,8 @@ def trigger():
     tare_first = bool(tare_first.get("tare_first", False))
 
     if mode == "poll":
+        global poll_tare_first
+        poll_tare_first = tare_first
         trigger_event.set()
         return {"status": "ok", "mode": "poll"}
     else:
@@ -262,11 +265,15 @@ def trigger():
 # ESP32 long-polls this until trigger fires (or 60s timeout)
 @app.route("/api/wait")
 def wait_trigger():
+    global poll_tare_first
     trigger_event.clear()
     fired = trigger_event.wait(timeout=60)
+    tare = False
     if fired:
         trigger_event.clear()
-    return {"trigger": fired}
+        tare = poll_tare_first
+        poll_tare_first = False
+    return {"trigger": fired, "tare_first": tare}
 
 
 # View results in browser

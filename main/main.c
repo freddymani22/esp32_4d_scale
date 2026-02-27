@@ -1150,12 +1150,12 @@ cleanup:
 
 // ============== TRIGGER: HTTP LONG POLL ==============
 
-static bool wait_for_trigger_poll(void)
+static bool wait_for_trigger_poll(bool *tare_first_out)
 {
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%d%s/api/wait", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
 
-    char body[64] = {0};
+    char body[96] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
 
     esp_http_client_config_t config = {
@@ -1170,10 +1170,15 @@ static bool wait_for_trigger_poll(void)
     esp_err_t err = esp_http_client_perform(client);
 
     bool triggered = false;
+    if (tare_first_out) *tare_first_out = false;
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
         triggered = (strstr(body, "\"trigger\":true") != NULL ||
                      strstr(body, "\"trigger\": true") != NULL);
-        ESP_LOGI(TAG, "Poll response: %s -> triggered=%d", body, triggered);
+        if (triggered && tare_first_out) {
+            *tare_first_out = (strstr(body, "\"tare_first\":true") != NULL ||
+                               strstr(body, "\"tare_first\": true") != NULL);
+        }
+        ESP_LOGI(TAG, "Poll response: %s -> triggered=%d tare=%d", body, triggered, tare_first_out ? *tare_first_out : 0);
     } else {
         ESP_LOGW(TAG, "Poll request failed (err=%s, status=%d)",
                  esp_err_to_name(err),
@@ -1347,8 +1352,9 @@ void app_main(void)
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "Ready — waiting for trigger...");
 
+        bool tare_first = false;
         if (strcmp(g_trigger_mode, "poll") == 0) {
-            while (!wait_for_trigger_poll()) {
+            while (!wait_for_trigger_poll(&tare_first)) {
                 // server timed out (60s), retry immediately
             }
         } else {
@@ -1356,6 +1362,11 @@ void app_main(void)
             while (!wait_for_trigger_tcp()) {
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
+        }
+
+        if (tare_first) {
+            ESP_LOGI(TAG, ">>> Tare requested — re-taring...");
+            hx711_read_tare();
         }
 
         ESP_LOGI(TAG, ">>> Triggered! Refreshing config...");
