@@ -143,17 +143,17 @@ static int32_t hx711_read_raw(void)
     // taskENTER_CRITICAL(&mux);
     for (int i = 0; i < 24; i++) {
         gpio_set_level(HX711_SCK_PIN, 1);
-        ets_delay_us(30);
+        ets_delay_us(10);
         data = (data << 1) | gpio_get_level(HX711_DOUT_PIN);
         gpio_set_level(HX711_SCK_PIN, 0);
-        ets_delay_us(30);
+        ets_delay_us(10);
     }
 
     // 25th pulse: set gain to 128 for channel A
     gpio_set_level(HX711_SCK_PIN, 1);
-    ets_delay_us(30);
+    ets_delay_us(10);
     gpio_set_level(HX711_SCK_PIN, 0);
-    ets_delay_us(30);
+    ets_delay_us(10);
     // taskEXIT_CRITICAL(&mux);
 
     // Convert from 24-bit two's complement
