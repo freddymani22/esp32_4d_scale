@@ -332,7 +332,7 @@ static float ultrasonic_read_cm(void)
 
     // Send 10us trigger pulse
     gpio_set_level(US_TRIG_PIN, 0);
-    ets_delay_us(30);
+    ets_delay_us(10);
     gpio_set_level(US_TRIG_PIN, 1);
     ets_delay_us(20);
     gpio_set_level(US_TRIG_PIN, 0);
