@@ -1,15 +1,25 @@
+// ============== DEVICE MODE ==============
+// 1 = Full device (ESP32-CAM): camera + ultrasonic + HX711
+// 0 = HX711 only: weight measurement + WiFi upload (no camera, no PSRAM needed)
+#define DEVICE_MODE 1
+// =========================================
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
 #include "esp_log.h"
+#if DEVICE_MODE == 1
 #include "esp_camera.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_heap_caps.h"
+#if DEVICE_MODE == 1
 #include "esp_psram.h"
+#endif
 #include "driver/gpio.h"
 #include "rom/ets_sys.h"
 #include "esp_wifi.h"
@@ -43,11 +53,13 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT      BIT1
 static int s_retry_num = 0;
 
+#if DEVICE_MODE == 1
 // ============== ULTRASONIC SENSOR (HC-SR04) ==============
 #define US_TRIG_PIN     13
 #define US_ECHO_PIN     2
 #define ROOM_TEMP_C     30.0f   // Room temperature in °C (affects speed of sound)
 #define US_CAL_FACTOR   1.0f    // Distance correction: actual_cm / measured_cm
+#endif
 
 // ============== HX711 CONFIGURATION ==============
 #define HX711_DOUT_PIN  14
@@ -55,6 +67,7 @@ static int s_retry_num = 0;
 
 static const char *TAG = "measure";
 
+#if DEVICE_MODE == 1
 // ============== CONFIGURATION ==============
 #define SOBEL_THRESHOLD     60      // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
 #define DILATION_ITERATIONS 1       // Close edge gaps after Sobel (increase if contour has breaks)
@@ -76,7 +89,9 @@ static const char *TAG = "measure";
 #define CALIBRATION_DIST_CM 153.28f  // Reference distance (cm) for PIXELS_PER_MM_REF
 #define FIXED_BASELINE_CM      153.28f // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
+#endif // DEVICE_MODE == 1
 
+#if DEVICE_MODE == 1
 // AI-Thinker ESP32-CAM Pin Mapping
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -95,9 +110,11 @@ static const char *TAG = "measure";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 #define FLASH_GPIO_NUM     4      // On-board flash LED
+#endif
 
 // ============== DATA STRUCTURES ==============
 
+#if DEVICE_MODE == 1
 typedef struct {
     float x;
     float y;
@@ -113,6 +130,7 @@ typedef struct {
     float width_mm;
     bool valid;
 } min_area_rect_t;
+#endif
 
 // ============== HX711 LOAD CELL ==============
 
@@ -275,10 +293,12 @@ static void hx711_read_tare(void)
     hx711_tare = hx711_read_filtered_into("Tare", hx711_tare_readings);
 }
 
+#if DEVICE_MODE == 1
 static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
 static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
+#endif
 
 static float hx711_read_grams(void)
 {
@@ -292,6 +312,7 @@ static float hx711_read_grams(void)
     return grams;
 }
 
+#if DEVICE_MODE == 1
 // ============== ULTRASONIC SENSOR ==============
 
 static void ultrasonic_init(void)
@@ -395,6 +416,7 @@ static float ultrasonic_measure(void)
     }
     return sum / valid;
 }
+#endif // DEVICE_MODE == 1
 
 // ============== WIFI ==============
 
@@ -616,6 +638,7 @@ static void fetch_config(void)
     esp_http_client_cleanup(client);
 }
 
+#if DEVICE_MODE == 1
 // ============== HTTP UPLOAD ==============
 
 static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
@@ -673,6 +696,9 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
     esp_http_client_cleanup(client);
     return success;
 }
+
+#if DEVICE_MODE == 1
+// ============== IMAGE PROCESSING ==============
 
 // ============== STEP 1: SOBEL EDGE DETECTION ==============
 
@@ -1168,6 +1194,7 @@ cleanup:
 
     return result;
 }
+#endif // DEVICE_MODE == 1
 
 // ============== TRIGGER: HTTP LONG POLL ==============
 
@@ -1316,6 +1343,56 @@ static esp_err_t init_camera(void)
     ESP_LOGI(TAG, "Camera ready!");
     return ESP_OK;
 }
+#endif // DEVICE_MODE == 1
+
+#if DEVICE_MODE == 0
+// ============== WEIGHT-ONLY UPLOAD (HX711 mode) ==============
+
+static bool upload_weight_only(float weight_g)
+{
+    char url[512];
+    snprintf(url, sizeof(url),
+             "http://%s:%d%s/upload?valid=0&length_mm=0&width_mm=0"
+             "&length_px=0&width_px=0&angle=0&weight_g=%.1f"
+             "&raw_tare=%ld&raw_avg=%ld"
+             "&baseline_cm=0&object_cm=0&height_cm=0&pixels_per_mm=0"
+             "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld",
+             SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX,
+             weight_g,
+             (long)hx711_tare, (long)hx711_raw_avg,
+             (long)hx711_tare_readings[0], (long)hx711_tare_readings[1],
+             (long)hx711_tare_readings[2], (long)hx711_tare_readings[3],
+             (long)hx711_tare_readings[4],
+             (long)hx711_raw_readings[0], (long)hx711_raw_readings[1],
+             (long)hx711_raw_readings[2], (long)hx711_raw_readings[3],
+             (long)hx711_raw_readings[4]);
+
+    ESP_LOGI(TAG, "Uploading weight to %s...", url);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+        .event_handler = http_event_handler,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    esp_http_client_set_post_field(client, NULL, 0);
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool success = false;
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Upload complete! HTTP %d", status);
+        success = (status == 200);
+    } else {
+        ESP_LOGE(TAG, "Upload failed: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+    return success;
+}
+#endif // DEVICE_MODE == 0
 
 // ============== MAIN ==============
 
@@ -1326,10 +1403,16 @@ void app_main(void)
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
+#if DEVICE_MODE == 1
     ESP_LOGI(TAG, "║   ESP32-CAM Object Measurement        ║");
     ESP_LOGI(TAG, "║   Min Area Rectangle Detection        ║");
+#else
+    ESP_LOGI(TAG, "║   ESP32 HX711 Weight Sensor           ║");
+    ESP_LOGI(TAG, "║   Weight Upload Mode                  ║");
+#endif
     ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
 
+#if DEVICE_MODE == 1
     print_memory_info();
 
     if (init_camera() != ESP_OK) {
@@ -1344,11 +1427,13 @@ void app_main(void)
         if (fb) esp_camera_fb_return(fb);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+#endif
 
     // Tare on empty board (before WiFi for clean ADC readings)
     hx711_init();
     hx711_read_tare();
 
+#if DEVICE_MODE == 1
     ultrasonic_init();
 
     // Measure baseline distance to empty board (once at boot)
@@ -1359,6 +1444,7 @@ void app_main(void)
         g_baseline_cm = FIXED_BASELINE_CM;
     }
     ESP_LOGI(TAG, ">>> Baseline: %.2f cm", g_baseline_cm);
+#endif
 
     // Connect WiFi and fetch server config (cal_factor + trigger_mode)
     bool wifi_ok = wifi_init();
@@ -1399,6 +1485,7 @@ void app_main(void)
         float weight_g = hx711_read_grams();
         ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
 
+#if DEVICE_MODE == 1
         // Ultrasonic height (baseline was captured at boot)
         ESP_LOGI(TAG, ">>> Measuring object distance (baseline=%.2f cm)...", g_baseline_cm);
         g_object_cm = ultrasonic_measure();
@@ -1412,7 +1499,6 @@ void app_main(void)
                      g_dynamic_ppmm, PIXELS_PER_MM_REF, CALIBRATION_DIST_CM);
         } else {
             g_object_height_cm = 0;
-            // Only fall back to PIXELS_PER_MM_REF if server didn't provide a value
             if (g_dynamic_ppmm <= 0.0f) g_dynamic_ppmm = PIXELS_PER_MM_REF;
             ESP_LOGW(TAG, ">>> Object distance: N/A — using ppmm=%.4f", g_dynamic_ppmm);
         }
@@ -1515,6 +1601,16 @@ void app_main(void)
         }
 
         heap_caps_free(img_copy);
+#else
+        // HX711 only mode — just upload weight
+        ESP_LOGI(TAG, "╔═══════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║  Weight: %.1f g  (%.3f kg)            ", weight_g, weight_g / 1000.0f);
+        ESP_LOGI(TAG, "╚═══════════════════════════════════════╝");
+        if (wifi_ok) {
+            upload_weight_only(weight_g);
+        }
+#endif
+
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "Done. Waiting for next trigger...");
     }

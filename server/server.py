@@ -61,19 +61,19 @@ def convert_pgm_to_png(pgm_path):
 @app.route("/upload", methods=["POST"])
 def upload():
     data = request.get_data()
-    if len(data) == 0:
-        return {"status": "error", "message": "no data"}, 400
 
-    # Save image
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pgm_name = f"result_{timestamp}.pgm"
-    pgm_path = os.path.join(UPLOAD_DIR, pgm_name)
-    with open(pgm_path, "wb") as f:
-        f.write(data)
-
-    # Convert to PNG
-    img_filename = convert_pgm_to_png(pgm_path)
-    print(f"Saved: {img_filename} ({len(data)} bytes)")
+    # Save image if present, otherwise weight-only upload (HX711 mode)
+    if len(data) > 0:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pgm_name = f"result_{timestamp}.pgm"
+        pgm_path = os.path.join(UPLOAD_DIR, pgm_name)
+        with open(pgm_path, "wb") as f:
+            f.write(data)
+        img_filename = convert_pgm_to_png(pgm_path)
+        print(f"Saved: {img_filename} ({len(data)} bytes)")
+    else:
+        img_filename = ""
+        print("Weight-only upload (no image)")
 
     # Parse measurements from query params
     entry = {
