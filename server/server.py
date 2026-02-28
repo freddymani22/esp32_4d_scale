@@ -3,11 +3,21 @@ import os
 import json
 import threading
 import socket as sock_lib
+import time
 from datetime import datetime
 from PIL import Image
 
-trigger_event = threading.Event()
+# Separate trigger events for each ESP32 mode
+trigger_event_mode0 = threading.Event()  # HX711 ESP32
+trigger_event_mode1 = threading.Event()  # Camera ESP32
+poll_lock = threading.Lock()
 poll_tare_first = False
+poll_remeasure_baseline = False
+# Shared measurement ID sent to both ESP32s on a "both" trigger so uploads can be merged
+pending_measurement_id_mode0 = None
+pending_measurement_id_mode1 = None
+
+# TCP (kept for future use, not actively used)
 tcp_client_conn = None
 tcp_client_lock = threading.Lock()
 
@@ -57,6 +67,31 @@ def convert_pgm_to_png(pgm_path):
         return os.path.basename(pgm_path)
 
 
+def merge_into(existing, new_entry):
+    """Merge new_entry fields into existing entry, preferring non-zero/non-empty values."""
+    # Camera fields: take from new if existing is zero/empty
+    for key in ("image", "length_mm", "width_mm", "length_px", "width_px",
+                "angle", "height_cm", "pixels_per_mm"):
+        new_val = new_entry.get(key)
+        if new_val and (isinstance(new_val, str) and new_val != "" or
+                        isinstance(new_val, float) and new_val != 0.0):
+            existing[key] = new_val
+    # valid: True if either is True
+    if new_entry.get("valid"):
+        existing["valid"] = True
+    # HX711 fields: take from new if existing is zero
+    for key in ("weight_g", "raw_tare", "raw_avg"):
+        if new_entry.get(key, 0) != 0:
+            existing[key] = new_entry[key]
+    for key in ("tare_readings", "weight_readings"):
+        if new_entry.get(key, ""):
+            existing[key] = new_entry[key]
+    # Ultrasonic fields: take positive values
+    for key in ("baseline_cm", "object_cm"):
+        if new_entry.get(key, -1) > 0:
+            existing[key] = new_entry[key]
+
+
 # ESP32 sends images + measurements here
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -76,7 +111,9 @@ def upload():
         print("Weight-only upload (no image)")
 
     # Parse measurements from query params
+    measurement_id = request.args.get("measurement_id", "")
     entry = {
+        "measurement_id": measurement_id,
         "image": img_filename,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "valid": request.args.get("valid", "0") == "1",
@@ -97,6 +134,16 @@ def upload():
     }
 
     measurements = load_measurements()
+
+    # If measurement_id matches an existing pending entry, merge rather than insert
+    if measurement_id:
+        existing = next((m for m in measurements if m.get("measurement_id") == measurement_id), None)
+        if existing:
+            merge_into(existing, entry)
+            save_measurements(measurements)
+            print(f"Merged upload into measurement_id={measurement_id}")
+            return {"status": "ok", "merged": True}, 200
+
     measurements.insert(0, entry)
     save_measurements(measurements)
 
@@ -126,7 +173,7 @@ def get_config():
     cfg = load_config()
     return {
         "cal_factor": cfg.get("cal_factor", DEFAULT_CAL_FACTOR),
-        "trigger_mode": cfg.get("trigger_mode", "tcp"),
+        "trigger_mode": cfg.get("trigger_mode", "poll"),
         "baseline_cm": cfg.get("baseline_cm", 0),
         "raw_capture": cfg.get("raw_capture", False),
         "board_p0x": cfg.get("board_p0x", 50),  "board_p0y": cfg.get("board_p0y", 18),
@@ -203,6 +250,7 @@ def delete_measurement():
             os.remove(img_path)
     return {"status": "ok"}
 
+
 # Save trigger mode
 @app.route("/api/set_trigger_mode", methods=["POST"])
 def set_trigger_mode():
@@ -234,46 +282,72 @@ def set_baseline():
 
 
 # Frontend triggers a measurement
+# target: "both" | "camera" (mode 1) | "weight" (mode 0)
+# tare_first: bool — re-tare before weighing (weight target)
+# remeasure_baseline: bool — re-measure empty board distance (camera target)
 @app.route("/api/trigger", methods=["POST"])
 def trigger():
-    global tcp_client_conn
-    cfg = load_config()
-    mode = cfg.get("trigger_mode", "tcp")
-    tare_first = request.get_json(silent=True) or {}
-    tare_first = bool(tare_first.get("tare_first", False))
+    global poll_tare_first, poll_remeasure_baseline
+    global pending_measurement_id_mode0, pending_measurement_id_mode1
+    body = request.get_json(silent=True) or {}
+    target = body.get("target", "both")
+    tare_first = bool(body.get("tare_first", False))
+    remeasure_baseline = bool(body.get("remeasure_baseline", False))
 
-    if mode == "poll":
-        global poll_tare_first
+    # Generate shared measurement ID (millisecond timestamp)
+    measurement_id = str(int(time.time() * 1000))
+
+    with poll_lock:
         poll_tare_first = tare_first
-        trigger_event.set()
-        return {"status": "ok", "mode": "poll"}
-    else:
-        with tcp_client_lock:
-            conn = tcp_client_conn
-        if conn is None:
-            return {"status": "error", "message": "No ESP32 connected on TCP"}, 503
-        try:
-            cmd = b"TARE_MEASURE\n" if tare_first else b"MEASURE\n"
-            conn.sendall(cmd)
-            return {"status": "ok", "mode": "tcp", "tare_first": tare_first}
-        except Exception as e:
-            with tcp_client_lock:
-                tcp_client_conn = None
-            return {"status": "error", "message": str(e)}, 503
+        poll_remeasure_baseline = remeasure_baseline
+        if target in ("both", "weight"):
+            pending_measurement_id_mode0 = measurement_id
+        if target in ("both", "camera"):
+            pending_measurement_id_mode1 = measurement_id
+
+    if target in ("both", "weight"):
+        trigger_event_mode0.set()
+    if target in ("both", "camera"):
+        trigger_event_mode1.set()
+
+    print(f"Trigger: target={target} id={measurement_id} tare_first={tare_first} remeasure_baseline={remeasure_baseline}")
+    return {"status": "ok", "target": target, "measurement_id": measurement_id}
 
 
 # ESP32 long-polls this until trigger fires (or 60s timeout)
+# ?mode=0 → HX711 ESP32, ?mode=1 → Camera ESP32
 @app.route("/api/wait")
 def wait_trigger():
-    global poll_tare_first
-    trigger_event.clear()
-    fired = trigger_event.wait(timeout=60)
-    tare = False
-    if fired:
-        trigger_event.clear()
-        tare = poll_tare_first
-        poll_tare_first = False
-    return {"trigger": fired, "tare_first": tare}
+    global poll_tare_first, poll_remeasure_baseline
+    global pending_measurement_id_mode0, pending_measurement_id_mode1
+    mode = request.args.get("mode", "1")
+
+    if mode == "0":
+        trigger_event_mode0.clear()
+        fired = trigger_event_mode0.wait(timeout=60)
+        tare = False
+        mid = ""
+        if fired:
+            trigger_event_mode0.clear()
+            with poll_lock:
+                tare = poll_tare_first
+                poll_tare_first = False
+                mid = pending_measurement_id_mode0 or ""
+                pending_measurement_id_mode0 = None
+        return {"trigger": fired, "tare_first": tare, "measurement_id": mid}
+    else:
+        trigger_event_mode1.clear()
+        fired = trigger_event_mode1.wait(timeout=60)
+        remeasure = False
+        mid = ""
+        if fired:
+            trigger_event_mode1.clear()
+            with poll_lock:
+                remeasure = poll_remeasure_baseline
+                poll_remeasure_baseline = False
+                mid = pending_measurement_id_mode1 or ""
+                pending_measurement_id_mode1 = None
+        return {"trigger": fired, "remeasure_baseline": remeasure, "measurement_id": mid}
 
 
 # View results in browser
@@ -298,6 +372,16 @@ PAGE_TEMPLATE = """
         body { font-family: 'Segoe UI', monospace; background: #0f0f0f; color: #e0e0e0; padding: 24px; }
         h1 { color: #4fc3f7; margin-bottom: 4px; font-size: 22px; }
         .subtitle { color: #888; margin-bottom: 24px; font-size: 13px; }
+        .panels { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
+        .panel {
+            background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
+            padding: 20px; flex: 1 1 320px; max-width: 480px;
+        }
+        .panel h2 { font-size: 15px; margin-bottom: 14px; }
+        .panel h2.blue  { color: #4fc3f7; }
+        .panel h2.amber { color: #ffb74d; }
+        .panel h2.green { color: #81c784; }
+        .panel h2.pink  { color: #f06292; }
         .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
         .card {
             background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
@@ -326,143 +410,150 @@ PAGE_TEMPLATE = """
         .dim-sub { color: #666; font-size: 11px; }
         .no-detect { color: #ef5350; font-style: italic; padding: 10px; text-align: center; }
         .empty { color: #555; text-align: center; padding: 60px; font-size: 16px; }
-        .cal-section {
-            background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
-            padding: 20px; margin-bottom: 24px; max-width: 480px;
-        }
-        .cal-section h2 { color: #ffb74d; font-size: 16px; margin-bottom: 12px; }
-        .cal-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
-        .cal-row label { color: #aaa; font-size: 13px; min-width: 110px; }
-        .cal-row input {
+        .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+        .row label { color: #aaa; font-size: 13px; min-width: 120px; }
+        input[type=number], input[type=text] {
             background: #222; border: 1px solid #444; border-radius: 6px;
-            color: #fff; padding: 8px 12px; font-size: 14px; width: 140px;
+            color: #fff; padding: 8px 12px; font-size: 14px; width: 130px;
         }
-        .cal-row input:focus { outline: none; border-color: #ffb74d; }
-        .cal-btn {
-            background: #ffb74d; color: #000; border: none; border-radius: 6px;
-            padding: 8px 20px; font-size: 14px; font-weight: bold; cursor: pointer;
+        input[type=number]:focus { outline: none; border-color: #4fc3f7; }
+        .hint { color: #666; font-size: 12px; margin-top: 6px; }
+        .result { font-size: 13px; margin-top: 8px; display: none; }
+        .current-val { color: #81c784; font-size: 13px; margin-bottom: 10px; }
+
+        /* Buttons */
+        .btn {
+            border: none; border-radius: 6px;
+            padding: 9px 22px; font-size: 14px; font-weight: bold; cursor: pointer;
         }
-        .cal-btn:hover { background: #ffa726; }
-        .cal-btn:disabled { background: #555; color: #888; cursor: not-allowed; }
-        .cal-info { color: #888; font-size: 12px; margin-top: 8px; }
-        .cal-result { color: #4fc3f7; font-size: 13px; margin-top: 8px; display: none; }
-        .cal-current { color: #81c784; font-size: 13px; margin-bottom: 12px; }
+        .btn:disabled { background: #555 !important; color: #888 !important; cursor: not-allowed; }
+        .btn-blue  { background: #4fc3f7; color: #000; }
+        .btn-blue:hover  { background: #29b6f6; }
+        .btn-amber { background: #ffb74d; color: #000; }
+        .btn-amber:hover { background: #ffa726; }
+        .btn-green { background: #81c784; color: #000; }
+        .btn-green:hover { background: #66bb6a; }
+        .btn-pink  { background: #f06292; color: #000; }
+        .btn-pink:hover  { background: #ec407a; }
+        .btn-red   { background: #c0392b; color: #fff; }
+        .btn-red:hover   { background: #e74c3c; }
+
         .raw-info { color: #666; font-size: 11px; margin-top: 4px; }
-        .trigger-section {
-            background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
-            padding: 20px; margin-bottom: 24px; max-width: 480px;
+        .board-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px;
         }
-        .trigger-section h2 { color: #4fc3f7; font-size: 16px; margin-bottom: 12px; }
-        .trigger-btn {
-            background: #4fc3f7; color: #000; border: none; border-radius: 6px;
-            padding: 10px 28px; font-size: 15px; font-weight: bold; cursor: pointer;
-        }
-        .trigger-btn:hover { background: #29b6f6; }
-        .trigger-btn:disabled { background: #555; color: #888; cursor: not-allowed; }
-        .trigger-result { font-size: 13px; margin-top: 8px; display: none; }
+        .board-cell { background: #222; border-radius: 6px; padding: 8px; text-align: center; }
+        .board-cell .dim-label { color: #888; font-size: 10px; letter-spacing: 1px; margin-bottom: 4px; }
+        .board-cell .inputs { display: flex; gap: 6px; justify-content: center; }
+        .board-cell input { width: 58px !important; padding: 4px !important; text-align: center; }
     </style>
 </head>
 <body>
     <h1>ESP32 4D Scale</h1>
     <p class="subtitle">{{ measurements|length }} measurement{{ 's' if measurements|length != 1 }} captured</p>
 
-    <div class="trigger-section">
-        <h2>Trigger Measurement</h2>
-        <div class="cal-current" style="margin-bottom:12px;">
-            Mode:
-            <label style="margin-left:10px;cursor:pointer;">
-                <input type="radio" name="triggerMode" value="tcp" {% if config.get('trigger_mode','tcp')=='tcp' %}checked{% endif %} onchange="doSetTriggerMode('tcp')"> TCP
-            </label>
-            <label style="margin-left:16px;cursor:pointer;">
-                <input type="radio" name="triggerMode" value="poll" {% if config.get('trigger_mode','tcp')=='poll' %}checked{% endif %} onchange="doSetTriggerMode('poll')"> Long Poll
-            </label>
-            <span id="modeResult" style="margin-left:12px;font-size:12px;color:#888;"></span>
-        </div>
-        <div style="margin-bottom:12px;display:flex;flex-direction:column;gap:8px;">
-            <label style="cursor:pointer;color:#aaa;font-size:13px;">
-                <input type="checkbox" id="tareFirst"> Tare before measuring
-            </label>
-            <label style="cursor:pointer;color:#aaa;font-size:13px;">
-                <input type="checkbox" id="rawCaptureCheck" {% if config.get('raw_capture') %}checked{% endif %} onchange="doSetRawCapture(this.checked)"> Raw capture (unprocessed image)
-            </label>
-        </div>
-        <button class="trigger-btn" id="triggerBtn" onclick="doTrigger()">&#9654; Measure Now</button>
-        <div class="trigger-result" id="triggerResult"></div>
-    </div>
+    <div class="panels">
 
-    <div class="cal-section">
-        <h2>Baseline Distance</h2>
-        <div class="cal-current">Current baseline: <strong id="currentBaseline">{{ config.get('baseline_cm', 0) }}</strong> cm
-            {% if config.get('baseline_cm', 0) == 0 %}<span style="color:#888"> (auto — measured at boot)</span>{% endif %}
+        <!-- MEASURE -->
+        <div class="panel">
+            <h2 class="blue">Trigger Measurement</h2>
+            <p class="hint" style="margin-bottom:14px;">Triggers both ESP32s simultaneously — camera captures dimensions, HX711 measures weight.</p>
+            <button class="btn btn-blue" id="btnMeasure" onclick="doTrigger('both')">&#9654; Measure</button>
+            <div class="result" id="resultMeasure"></div>
         </div>
-        <div class="cal-row">
-            <label>Distance (cm):</label>
-            <input type="number" id="baselineInput" step="0.1" min="1" placeholder="e.g. 153.5">
-            <button class="cal-btn" onclick="doSetBaseline()">Save</button>
-        </div>
-        <div class="cal-info">Set to 0 to let the ESP32 measure it automatically on next boot.</div>
-        <div class="cal-result" id="baselineResult"></div>
-    </div>
 
-    <div class="cal-section">
-        <h2>Weight Calibration</h2>
-        <div class="cal-info" style="margin-bottom:10px;">Place a known weight on the board, trigger a measurement, then enter the actual weight below and click Calibrate.</div>
-        <div class="cal-row" style="flex-wrap:wrap;gap:8px;margin-bottom:10px;">
-            <label>Known weight (g):</label>
-            <input type="number" id="knownWeight" placeholder="e.g. 500" step="0.1" style="width:100px;">
-            <button class="cal-btn" onclick="doWeightCalibrate()">Calibrate</button>
+        <!-- BASELINE -->
+        <div class="panel">
+            <h2 class="green">Baseline Distance (Camera ESP32)</h2>
+            <div class="current-val">Current: <strong id="currentBaseline">{{ config.get('baseline_cm', 0) }}</strong> cm
+                {% if config.get('baseline_cm', 0) == 0 %}<span style="color:#888"> (auto at boot)</span>{% endif %}
+            </div>
+            <p class="hint" style="margin-bottom:10px;">Re-measure: place empty board and trigger camera ESP32 to read the ultrasonic baseline.</p>
+            <button class="btn btn-green" id="btnBaseline" onclick="doTrigger('camera', {remeasure_baseline: true})" style="margin-bottom:12px;">
+                &#8635; Re-measure Baseline
+            </button>
+            <div class="result" id="resultBaseline"></div>
+            <hr style="border-color:#333;margin:12px 0;">
+            <p class="hint" style="margin-bottom:8px;">Or enter manually:</p>
+            <div class="row">
+                <label>Distance (cm):</label>
+                <input type="number" id="baselineInput" step="0.1" min="1" placeholder="e.g. 153.5">
+                <button class="btn btn-green" onclick="doSetBaseline()">Save</button>
+            </div>
+            <div class="result" id="resultBaselineSave"></div>
         </div>
-        <div class="cal-row" style="flex-wrap:wrap;gap:8px;">
-            <label>Current cal_factor:</label>
-            <span style="color:#4fc3f7;font-weight:bold;" id="calFactorDisplay">{{ config.get('cal_factor', 27.93) }}</span>
-        </div>
-        <div class="cal-result" id="weightCalResult"></div>
-    </div>
 
-    <div class="cal-section">
-        <h2>Board Calibration</h2>
-        <div class="cal-info" style="margin-bottom:10px;">Enable "Raw capture" above, trigger a shot, run <code>find_coords.py</code> on the image and click all 4 plywood corners.</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
-            <div class="dim-box">
-                <div class="dim-label">P0 — Top-Left</div>
-                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
-                    <input type="number" id="bp0x" value="{{ config.get('board_p0x', 50) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                    <input type="number" id="bp0y" value="{{ config.get('board_p0y', 18) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                </div>
+        <!-- WEIGHT CALIBRATION -->
+        <div class="panel">
+            <h2 class="amber">Weight Calibration (HX711 ESP32)</h2>
+            <p class="hint" style="margin-bottom:10px;">Place a known weight on the board, trigger a tare+weigh, then enter the actual weight and calibrate.</p>
+            <button class="btn btn-amber" id="btnWeightTrigger" onclick="doTrigger('weight', {tare_first: true})" style="margin-bottom:12px;">
+                &#9654; Tare &amp; Weigh
+            </button>
+            <div class="result" id="resultWeightTrigger"></div>
+            <hr style="border-color:#333;margin:12px 0;">
+            <div class="row">
+                <label>Known weight (g):</label>
+                <input type="number" id="knownWeight" placeholder="e.g. 500" step="0.1" style="width:100px;">
+                <button class="btn btn-amber" onclick="doWeightCalibrate()">Calibrate</button>
             </div>
-            <div class="dim-box">
-                <div class="dim-label">P1 — Top-Right</div>
-                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
-                    <input type="number" id="bp1x" value="{{ config.get('board_p1x', 195) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                    <input type="number" id="bp1y" value="{{ config.get('board_p1y', 18) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                </div>
+            <div class="current-val" style="margin-top:10px;">
+                cal_factor: <strong id="calFactorDisplay">{{ config.get('cal_factor', 27.93) }}</strong>
             </div>
-            <div class="dim-box">
-                <div class="dim-label">P3 — Bottom-Left</div>
-                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
-                    <input type="number" id="bp3x" value="{{ config.get('board_p3x', 50) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                    <input type="number" id="bp3y" value="{{ config.get('board_p3y', 160) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                </div>
-            </div>
-            <div class="dim-box">
-                <div class="dim-label">P2 — Bottom-Right</div>
-                <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
-                    <input type="number" id="bp2x" value="{{ config.get('board_p2x', 195) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                    <input type="number" id="bp2y" value="{{ config.get('board_p2y', 160) }}" style="width:60px;background:#333;border:1px solid #555;border-radius:4px;color:#fff;padding:4px;text-align:center;">
-                </div>
-            </div>
+            <div class="result" id="resultWeightCal"></div>
         </div>
-        <div style="text-align:center;margin-bottom:10px;">
-            <button class="cal-btn" onclick="doSaveCrop()">Save Corners</button>
+
+        <!-- BOARD CALIBRATION -->
+        <div class="panel">
+            <h2 class="pink">Board Calibration (Camera ESP32)</h2>
+            <p class="hint" style="margin-bottom:10px;">Capture raw image to identify board corners, then save the coordinates.</p>
+            <div class="row" style="margin-bottom:12px;">
+                <label style="cursor:pointer;color:#aaa;">
+                    <input type="checkbox" id="rawCaptureCheck" {% if config.get('raw_capture') %}checked{% endif %} onchange="doSetRawCapture(this.checked)"> Raw capture mode
+                </label>
+                <button class="btn btn-pink" id="btnCapture" onclick="doCaptureRaw()">&#128247; Capture Raw</button>
+            </div>
+            <div class="result" id="resultCapture"></div>
+            <div class="board-grid">
+                <div class="board-cell">
+                    <div class="dim-label">P0 — Top-Left</div>
+                    <div class="inputs">
+                        <input type="number" id="bp0x" value="{{ config.get('board_p0x', 50) }}">
+                        <input type="number" id="bp0y" value="{{ config.get('board_p0y', 18) }}">
+                    </div>
+                </div>
+                <div class="board-cell">
+                    <div class="dim-label">P1 — Top-Right</div>
+                    <div class="inputs">
+                        <input type="number" id="bp1x" value="{{ config.get('board_p1x', 195) }}">
+                        <input type="number" id="bp1y" value="{{ config.get('board_p1y', 18) }}">
+                    </div>
+                </div>
+                <div class="board-cell">
+                    <div class="dim-label">P3 — Bottom-Left</div>
+                    <div class="inputs">
+                        <input type="number" id="bp3x" value="{{ config.get('board_p3x', 50) }}">
+                        <input type="number" id="bp3y" value="{{ config.get('board_p3y', 160) }}">
+                    </div>
+                </div>
+                <div class="board-cell">
+                    <div class="dim-label">P2 — Bottom-Right</div>
+                    <div class="inputs">
+                        <input type="number" id="bp2x" value="{{ config.get('board_p2x', 195) }}">
+                        <input type="number" id="bp2y" value="{{ config.get('board_p2y', 160) }}">
+                    </div>
+                </div>
+            </div>
+            <div class="row">
+                <label>Pixels/mm:</label>
+                <input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:90px;">
+                <button class="btn btn-pink" onclick="doSaveCrop()">Save Corners</button>
+            </div>
+            <div class="hint" style="margin-top:6px;">Image is 320×240. x, y per corner.</div>
+            <div class="result" id="resultCrop"></div>
         </div>
-        <div class="cal-row" style="flex-wrap:wrap;gap:8px;margin-top:4px;">
-            <label>Pixels/mm:</label>
-            <input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:90px;">
-            <span style="color:#888;font-size:11px;">current: {{ config.get('pixels_per_mm', 0.1644) }}</span>
-        </div>
-        <div class="cal-info">Image is 320x240. Each input pair is x, y. Layout matches plywood orientation.</div>
-        <div class="cal-result" id="cropResult"></div>
-    </div>
+
+    </div><!-- end panels -->
 
     {% if not measurements %}
     <div class="empty">Waiting for ESP32 to upload results...</div>
@@ -471,15 +562,15 @@ PAGE_TEMPLATE = """
     <div class="grid">
     {% for m in measurements %}
         <div class="card">
-            <img src="/files/{{ m.image }}" alt="result">
+            {% if m.image %}<img src="/files/{{ m.image }}" alt="result">{% endif %}
             <div class="info">
                 <div class="time">{{ m.timestamp }}</div>
                 {% if m.valid %}
                 <div class="dims">
                     <div class="dim-box">
                         <div class="dim-label">Length</div>
-                        <div class="dim-value w">{{ "%.2f"|format(m.get('length_mm', m.get('width_mm', 0)) / 10) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.get('length_mm', m.get('width_mm', 0))) }} mm</div>
+                        <div class="dim-value w">{{ "%.2f"|format(m.get('length_mm', 0) / 10) }} cm</div>
+                        <div class="dim-sub">{{ "%.1f"|format(m.get('length_mm', 0)) }} mm</div>
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Width</div>
@@ -488,9 +579,9 @@ PAGE_TEMPLATE = """
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Height</div>
-                        {% if m.get('height_cm', m.get('object_height_cm', 0)) > 0 %}
-                        <div class="dim-value ht">{{ "%.2f"|format(m.get('height_cm', m.get('object_height_cm', 0))) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.get('height_cm', m.get('object_height_cm', 0)) * 10) }} mm</div>
+                        {% if m.get('height_cm', 0) > 0 %}
+                        <div class="dim-value ht">{{ "%.2f"|format(m.get('height_cm', 0)) }} cm</div>
+                        <div class="dim-sub">{{ "%.1f"|format(m.get('height_cm', 0) * 10) }} mm</div>
                         {% else %}
                         <div class="dim-value ht">N/A</div>
                         {% endif %}
@@ -516,8 +607,8 @@ PAGE_TEMPLATE = """
                     </div>
                 </div>
                 <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} | ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
-                {% if m.get('tare_readings') %}<div class="raw-info">tare readings: {{ m.tare_readings }}</div>{% endif %}
-                {% if m.get('weight_readings') %}<div class="raw-info">weight readings: {{ m.weight_readings }}</div>{% endif %}
+                {% if m.get('tare_readings') %}<div class="raw-info">tare: {{ m.tare_readings }}</div>{% endif %}
+                {% if m.get('weight_readings') %}<div class="raw-info">weight: {{ m.weight_readings }}</div>{% endif %}
                 {% else %}
                 <div class="no-detect">No object detected</div>
                 <div class="dims">
@@ -545,11 +636,11 @@ PAGE_TEMPLATE = """
                         {% endif %}
                     </div>
                 </div>
-                {% if m.get('tare_readings') %}<div class="raw-info">tare readings: {{ m.tare_readings }}</div>{% endif %}
-                {% if m.get('weight_readings') %}<div class="raw-info">weight readings: {{ m.weight_readings }}</div>{% endif %}
+                {% if m.get('tare_readings') %}<div class="raw-info">tare: {{ m.tare_readings }}</div>{% endif %}
+                {% if m.get('weight_readings') %}<div class="raw-info">weight: {{ m.weight_readings }}</div>{% endif %}
                 {% endif %}
                 <div style="text-align:right;margin-top:6px;">
-                    <button onclick="doDelete('{{ m.image }}')" style="background:#c0392b;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px;">Delete</button>
+                    <button onclick="doDelete('{{ m.image }}')" class="btn btn-red" style="padding:4px 12px;font-size:12px;">Delete</button>
                 </div>
             </div>
         </div>
@@ -558,6 +649,85 @@ PAGE_TEMPLATE = """
 
     <script>
     const API_BASE = '';
+
+    async function doTrigger(target, extra) {
+        const btnMap = {both: 'btnMeasure', camera: 'btnBaseline', weight: 'btnWeightTrigger'};
+        const resultMap = {both: 'resultMeasure', camera: 'resultBaseline', weight: 'resultWeightTrigger'};
+        const btn = document.getElementById(btnMap[target]);
+        const result = document.getElementById(resultMap[target]);
+        if (btn) { btn.disabled = true; btn.textContent = '...'; }
+        if (result) result.style.display = 'none';
+        try {
+            const body = Object.assign({target}, extra || {});
+            const resp = await fetch(API_BASE + '/api/trigger', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+            const data = await resp.json();
+            if (result) {
+                result.style.display = 'block';
+                if (resp.ok) {
+                    result.style.color = '#81c784';
+                    const msgs = {
+                        both: 'Triggered both ESP32s — measuring...',
+                        camera: 'Triggered camera ESP32...',
+                        weight: 'Triggered HX711 ESP32 — taring then weighing...'
+                    };
+                    result.textContent = msgs[target] || 'Triggered.';
+                } else {
+                    result.style.color = '#ef5350';
+                    result.textContent = 'Error: ' + data.message;
+                }
+            }
+        } catch (e) {
+            if (result) {
+                result.style.display = 'block';
+                result.style.color = '#ef5350';
+                result.textContent = 'Request failed: ' + e.message;
+            }
+        }
+        if (btn) {
+            btn.disabled = false;
+            const labels = {btnMeasure: '\u25b6 Measure', btnBaseline: '\u8635 Re-measure Baseline', btnWeightTrigger: '\u25b6 Tare & Weigh'};
+            btn.textContent = labels[btn.id] || 'Trigger';
+        }
+    }
+
+    async function doCaptureRaw() {
+        const btn = document.getElementById('btnCapture');
+        const result = document.getElementById('resultCapture');
+        // Enable raw capture, then trigger camera
+        await fetch(API_BASE + '/api/set_board_crop', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({raw_capture: true})
+        });
+        document.getElementById('rawCaptureCheck').checked = true;
+        btn.disabled = true; btn.textContent = '...';
+        result.style.display = 'none';
+        try {
+            const resp = await fetch(API_BASE + '/api/trigger', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({target: 'camera'})
+            });
+            const data = await resp.json();
+            result.style.display = 'block';
+            if (resp.ok) {
+                result.style.color = '#f06292';
+                result.textContent = 'Camera triggered — raw image incoming...';
+            } else {
+                result.style.color = '#ef5350';
+                result.textContent = 'Error: ' + data.message;
+            }
+        } catch(e) {
+            result.style.display = 'block';
+            result.style.color = '#ef5350';
+            result.textContent = 'Request failed: ' + e.message;
+        }
+        btn.disabled = false; btn.textContent = '\uD83D\uDCF7 Capture Raw';
+    }
 
     async function doDelete(filename) {
         if (!confirm('Delete this measurement and image?')) return;
@@ -571,55 +741,6 @@ PAGE_TEMPLATE = """
         else alert('Delete failed: ' + data.message);
     }
 
-    async function doTrigger() {
-        const btn = document.getElementById('triggerBtn');
-        const result = document.getElementById('triggerResult');
-        btn.disabled = true;
-        btn.textContent = '...';
-        result.style.display = 'none';
-        try {
-            const tareFirst = document.getElementById('tareFirst').checked;
-            const resp = await fetch(API_BASE + '/api/trigger', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({tare_first: tareFirst})
-            });
-            const data = await resp.json();
-            result.style.display = 'block';
-            if (resp.ok) {
-                result.style.color = '#4fc3f7';
-                result.textContent = (tareFirst ? 'Taring then measuring...' : 'Measuring...') + ' (via ' + data.mode + ')';
-            } else {
-                result.style.color = '#ef5350';
-                result.textContent = 'Error: ' + data.message;
-            }
-        } catch (e) {
-            result.style.display = 'block';
-            result.style.color = '#ef5350';
-            result.textContent = 'Request failed: ' + e.message;
-        }
-        btn.disabled = false;
-        btn.textContent = '\u25b6 Measure Now';
-    }
-
-    async function doSetTriggerMode(mode) {
-        const status = document.getElementById('modeResult');
-        status.textContent = 'Saving...';
-        const resp = await fetch(API_BASE + '/api/set_trigger_mode', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({trigger_mode: mode})
-        });
-        const data = await resp.json();
-        if (resp.ok) {
-            status.style.color = '#81c784';
-            status.textContent = 'Saved. Takes effect on next trigger.';
-        } else {
-            status.style.color = '#ef5350';
-            status.textContent = 'Error: ' + data.message;
-        }
-    }
-
     async function doSetRawCapture(enabled) {
         await fetch(API_BASE + '/api/set_board_crop', {
             method: 'POST',
@@ -629,16 +750,13 @@ PAGE_TEMPLATE = """
     }
 
     async function doWeightCalibrate() {
-        const result = document.getElementById('weightCalResult');
+        const result = document.getElementById('resultWeightCal');
         const known = parseFloat(document.getElementById('knownWeight').value);
         if (!known || known <= 0) {
-            result.style.display = 'block';
-            result.style.color = '#f44';
-            result.textContent = 'Enter a valid known weight in grams.';
-            return;
+            result.style.display = 'block'; result.style.color = '#f44';
+            result.textContent = 'Enter a valid known weight in grams.'; return;
         }
-        result.style.display = 'block';
-        result.style.color = '#aaa';
+        result.style.display = 'block'; result.style.color = '#aaa';
         result.textContent = 'Calibrating...';
         try {
             const resp = await fetch(API_BASE + '/api/calibrate', {
@@ -649,20 +767,19 @@ PAGE_TEMPLATE = """
             const data = await resp.json();
             if (data.status === 'ok') {
                 result.style.color = '#4caf50';
-                result.textContent = `Calibrated! New cal_factor = ${data.cal_factor} (raw_diff = ${data.raw_diff})`;
+                result.textContent = `Done! cal_factor = ${data.cal_factor}  (raw_diff = ${data.raw_diff})`;
                 document.getElementById('calFactorDisplay').textContent = data.cal_factor;
             } else {
                 result.style.color = '#f44';
                 result.textContent = `Error: ${data.message}`;
             }
         } catch(e) {
-            result.style.color = '#f44';
-            result.textContent = 'Request failed.';
+            result.style.color = '#f44'; result.textContent = 'Request failed.';
         }
     }
 
     async function doSaveCrop() {
-        const result = document.getElementById('cropResult');
+        const result = document.getElementById('resultCrop');
         const body = {
             board_p0x: parseInt(document.getElementById('bp0x').value),
             board_p0y: parseInt(document.getElementById('bp0y').value),
@@ -682,8 +799,8 @@ PAGE_TEMPLATE = """
         const data = await resp.json();
         result.style.display = 'block';
         if (resp.ok) {
-            result.style.color = '#4fc3f7';
-            result.textContent = `Saved 4 corners. Takes effect on next trigger.`;
+            result.style.color = '#f06292';
+            result.textContent = 'Corners saved. Takes effect on next trigger.';
         } else {
             result.style.color = '#ef5350';
             result.textContent = 'Error: ' + data.message;
@@ -692,7 +809,7 @@ PAGE_TEMPLATE = """
 
     async function doSetBaseline() {
         const input = document.getElementById('baselineInput');
-        const result = document.getElementById('baselineResult');
+        const result = document.getElementById('resultBaselineSave');
         const val = parseFloat(input.value);
         if (!val || val <= 0) {
             result.style.display = 'block'; result.style.color = '#ef5350';
@@ -706,7 +823,7 @@ PAGE_TEMPLATE = """
         const data = await resp.json();
         result.style.display = 'block';
         if (resp.ok) {
-            result.style.color = '#4fc3f7';
+            result.style.color = '#81c784';
             result.textContent = 'Saved! Takes effect on next trigger.';
             document.getElementById('currentBaseline').textContent = data.baseline_cm;
         } else {
@@ -714,7 +831,6 @@ PAGE_TEMPLATE = """
             result.textContent = 'Error: ' + data.message;
         }
     }
-
     </script>
 </body>
 </html>
@@ -722,12 +838,12 @@ PAGE_TEMPLATE = """
 
 
 def tcp_server_thread():
-    """Accept ESP32 TCP connections and store the latest for trigger delivery."""
+    """Accept ESP32 TCP connections (kept for future use)."""
     global tcp_client_conn
     server_sock = sock_lib.socket(sock_lib.AF_INET, sock_lib.SOCK_STREAM)
     server_sock.setsockopt(sock_lib.SOL_SOCKET, sock_lib.SO_REUSEADDR, 1)
     server_sock.bind(("0.0.0.0", 9000))
-    server_sock.listen(1)
+    server_sock.listen(2)
     print("TCP trigger server listening on port 9000")
     while True:
         try:
@@ -750,7 +866,6 @@ if __name__ == "__main__":
     t = threading.Thread(target=tcp_server_thread, daemon=True)
     t.start()
 
-
     hostname = sock_lib.gethostname()
     local_ip = sock_lib.gethostbyname(hostname)
     print(f"\n{'='*50}")
@@ -758,7 +873,6 @@ if __name__ == "__main__":
     print(f"  Upload:  http://{local_ip}:8080/upload")
     print(f"  Viewer:  http://{local_ip}:8080/")
     print(f"  Trigger: POST http://{local_ip}:8080/api/trigger")
-    print(f"  TCP:     {local_ip}:9000")
     print(f"  Saves to: {UPLOAD_DIR}")
     print(f"{'='*50}\n")
     app.run(host="0.0.0.0", port=8080, threaded=True)

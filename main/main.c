@@ -1,5 +1,5 @@
 // ============== DEVICE MODE ==============
-// 1 = Full device (ESP32-CAM): camera + ultrasonic + HX711
+// 1 = Camera device (ESP32-CAM): camera + ultrasonic only (no HX711, no PSRAM needed for HX711)
 // 0 = HX711 only: weight measurement + WiFi upload (no camera, no PSRAM needed)
 #define DEVICE_MODE 1
 // =========================================
@@ -40,13 +40,18 @@
 #define SERVER_TCP_PORT  9000
 #define SERVER_PATH_PREFIX ""
 #define WIFI_MAX_RETRY  10
+#if DEVICE_MODE == 0
 #define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
+#endif
 static char g_trigger_mode[8] = "tcp";
+static char g_measurement_id[24] = {0};  // shared ID for merging dual-ESP32 uploads
+#if DEVICE_MODE == 1
 static bool g_raw_capture = false;
 // 4-point polygon defining the plywood board region (overridden by server config)
 // Order: P0=TL, P1=TR, P2=BR, P3=BL  (but any convex order works)
 static int g_board_pts[4][2] = {{50,18},{195,18},{195,160},{50,160}};
+#endif
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -61,11 +66,13 @@ static int s_retry_num = 0;
 #define US_CAL_FACTOR   1.0f    // Distance correction: actual_cm / measured_cm
 #endif
 
+static const char *TAG = "measure";
+
+#if DEVICE_MODE == 0
 // ============== HX711 CONFIGURATION ==============
 #define HX711_DOUT_PIN  14
 #define HX711_SCK_PIN   15
-
-static const char *TAG = "measure";
+#endif
 
 #if DEVICE_MODE == 1
 // ============== CONFIGURATION ==============
@@ -89,9 +96,7 @@ static const char *TAG = "measure";
 #define CALIBRATION_DIST_CM 153.28f  // Reference distance (cm) for PIXELS_PER_MM_REF
 #define FIXED_BASELINE_CM      153.28f // Fixed baseline distance (sensor to surface) in cm
 // ===========================================
-#endif // DEVICE_MODE == 1
 
-#if DEVICE_MODE == 1
 // AI-Thinker ESP32-CAM Pin Mapping
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -134,6 +139,7 @@ typedef struct {
 
 // ============== HX711 LOAD CELL ==============
 
+#if DEVICE_MODE == 0
 static bool hx711_is_ready(void)
 {
     return gpio_get_level(HX711_DOUT_PIN) == 0;
@@ -293,13 +299,6 @@ static void hx711_read_tare(void)
     hx711_tare = hx711_read_filtered_into("Tare", hx711_tare_readings);
 }
 
-#if DEVICE_MODE == 1
-static float g_baseline_cm = -1.0f;  // distance to empty surface
-static float g_object_cm = -1.0f;    // distance to object top
-static float g_object_height_cm = 0.0f;
-static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
-#endif
-
 static float hx711_read_grams(void)
 {
     int32_t filtered = hx711_read_filtered_into("Weight", hx711_raw_readings);
@@ -311,8 +310,14 @@ static float hx711_read_grams(void)
              grams, (long)filtered, (long)hx711_tare, (long)diff, hx711_cal_factor);
     return grams;
 }
+#endif // DEVICE_MODE == 0
 
 #if DEVICE_MODE == 1
+static float g_baseline_cm = -1.0f;  // distance to empty surface
+static float g_object_cm = -1.0f;    // distance to object top
+static float g_object_height_cm = 0.0f;
+static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
+
 // ============== ULTRASONIC SENSOR ==============
 
 static void ultrasonic_init(void)
@@ -539,6 +544,7 @@ static void fetch_config(void)
     esp_err_t err = esp_http_client_perform(client);
 
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+#if DEVICE_MODE == 0
         // Parse cal_factor
         const char *key = "\"cal_factor\"";
         char *pos = strstr(body, key);
@@ -555,7 +561,9 @@ static void fetch_config(void)
         } else {
             ESP_LOGW(TAG, "cal_factor not found in response: %s", body);
         }
+#endif
 
+#if DEVICE_MODE == 1
         // Parse baseline_cm (manual override from frontend)
         const char *bkey = "\"baseline_cm\"";
         char *bpos = strstr(body, bkey);
@@ -610,6 +618,7 @@ static void fetch_config(void)
         ESP_LOGI(TAG, "Board pts: (%d,%d) (%d,%d) (%d,%d) (%d,%d)",
                  g_board_pts[0][0], g_board_pts[0][1], g_board_pts[1][0], g_board_pts[1][1],
                  g_board_pts[2][0], g_board_pts[2][1], g_board_pts[3][0], g_board_pts[3][1]);
+#endif // DEVICE_MODE == 1
 
         // Parse trigger_mode
         const char *tkey = "\"trigger_mode\"";
@@ -650,7 +659,8 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
              "&length_px=%.1f&width_px=%.1f&angle=%.1f&weight_g=%.1f"
              "&raw_tare=%ld&raw_avg=%ld"
              "&baseline_cm=%.2f&object_cm=%.2f&height_cm=%.2f&pixels_per_mm=%.4f"
-             "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld",
+             "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld"
+             "&measurement_id=%s",
              SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX,
              rect->valid ? 1 : 0,
              rect->valid ? rect->length_mm : 0.0f,
@@ -659,14 +669,11 @@ static bool upload_result(uint8_t *pgm_data, size_t pgm_size,
              rect->valid ? rect->height : 0.0f,
              rect->valid ? rect->angle : 0.0f,
              weight_g,
-             (long)hx711_tare, (long)hx711_raw_avg,
+             0L, 0L,
              g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm,
-             (long)hx711_tare_readings[0], (long)hx711_tare_readings[1],
-             (long)hx711_tare_readings[2], (long)hx711_tare_readings[3],
-             (long)hx711_tare_readings[4],
-             (long)hx711_raw_readings[0], (long)hx711_raw_readings[1],
-             (long)hx711_raw_readings[2], (long)hx711_raw_readings[3],
-             (long)hx711_raw_readings[4]);
+             0L, 0L, 0L, 0L, 0L,
+             0L, 0L, 0L, 0L, 0L,
+             g_measurement_id);
 
     ESP_LOGI(TAG, "Upload params: baseline=%.2f cm, object=%.2f cm, object_height=%.2f cm, ppmm=%.4f",
              g_baseline_cm, g_object_cm, g_object_height_cm, g_dynamic_ppmm);
@@ -1194,16 +1201,17 @@ cleanup:
 
     return result;
 }
-#endif // DEVICE_MODE == 1
+#endif // DEVICE_MODE == 1 (process_image)
+#endif // DEVICE_MODE == 1 (upload_result)
 
 // ============== TRIGGER: HTTP LONG POLL ==============
 
-static bool wait_for_trigger_poll(bool *tare_first_out)
+static bool wait_for_trigger_poll(bool *tare_first_out, bool *remeasure_baseline_out)
 {
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d%s/api/wait", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
+    snprintf(url, sizeof(url), "http://%s:%d%s/api/wait?mode=%d", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX, DEVICE_MODE);
 
-    char body[96] = {0};
+    char body[128] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
 
     esp_http_client_config_t config = {
@@ -1219,14 +1227,39 @@ static bool wait_for_trigger_poll(bool *tare_first_out)
 
     bool triggered = false;
     if (tare_first_out) *tare_first_out = false;
+    if (remeasure_baseline_out) *remeasure_baseline_out = false;
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
         triggered = (strstr(body, "\"trigger\":true") != NULL ||
                      strstr(body, "\"trigger\": true") != NULL);
-        if (triggered && tare_first_out) {
-            *tare_first_out = (strstr(body, "\"tare_first\":true") != NULL ||
-                               strstr(body, "\"tare_first\": true") != NULL);
+        if (triggered) {
+            if (tare_first_out)
+                *tare_first_out = (strstr(body, "\"tare_first\":true") != NULL ||
+                                   strstr(body, "\"tare_first\": true") != NULL);
+            if (remeasure_baseline_out)
+                *remeasure_baseline_out = (strstr(body, "\"remeasure_baseline\":true") != NULL ||
+                                           strstr(body, "\"remeasure_baseline\": true") != NULL);
         }
-        ESP_LOGI(TAG, "Poll response: %s -> triggered=%d tare=%d", body, triggered, tare_first_out ? *tare_first_out : 0);
+        // Parse measurement_id
+        g_measurement_id[0] = '\0';
+        const char *idkey = "\"measurement_id\"";
+        char *idpos = strstr(body, idkey);
+        if (idpos) {
+            idpos += strlen(idkey);
+            while (*idpos == ':' || *idpos == ' ') idpos++;
+            if (*idpos == '"') {
+                idpos++;
+                int i = 0;
+                while (*idpos && *idpos != '"' && i < (int)(sizeof(g_measurement_id) - 1))
+                    g_measurement_id[i++] = *idpos++;
+                g_measurement_id[i] = '\0';
+            }
+        }
+
+        ESP_LOGI(TAG, "Poll response: %s -> triggered=%d tare=%d rebaseline=%d id=%s",
+                 body, triggered,
+                 tare_first_out ? *tare_first_out : 0,
+                 remeasure_baseline_out ? *remeasure_baseline_out : 0,
+                 g_measurement_id);
     } else {
         ESP_LOGW(TAG, "Poll request failed (err=%s, status=%d)",
                  esp_err_to_name(err),
@@ -1274,7 +1307,9 @@ static bool wait_for_trigger_tcp(void)
         buf[len] = '\0';
         if (strstr(buf, "TARE_MEASURE")) {
             ESP_LOGI(TAG, "TCP: TARE_MEASURE — re-taring first...");
+#if DEVICE_MODE == 0
             hx711_read_tare();
+#endif
             triggered = true;
             break;
         } else if (strstr(buf, "MEASURE")) {
@@ -1288,6 +1323,7 @@ static bool wait_for_trigger_tcp(void)
     return triggered;
 }
 
+#if DEVICE_MODE == 1
 // ============== HARDWARE INIT FUNCTIONS ==============
 
 static void print_memory_info(void)
@@ -1356,7 +1392,8 @@ static bool upload_weight_only(float weight_g)
              "&length_px=0&width_px=0&angle=0&weight_g=%.1f"
              "&raw_tare=%ld&raw_avg=%ld"
              "&baseline_cm=0&object_cm=0&height_cm=0&pixels_per_mm=0"
-             "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld",
+             "&tare_r=%ld,%ld,%ld,%ld,%ld&weight_r=%ld,%ld,%ld,%ld,%ld"
+             "&measurement_id=%s",
              SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX,
              weight_g,
              (long)hx711_tare, (long)hx711_raw_avg,
@@ -1365,7 +1402,8 @@ static bool upload_weight_only(float weight_g)
              (long)hx711_tare_readings[4],
              (long)hx711_raw_readings[0], (long)hx711_raw_readings[1],
              (long)hx711_raw_readings[2], (long)hx711_raw_readings[3],
-             (long)hx711_raw_readings[4]);
+             (long)hx711_raw_readings[4],
+             g_measurement_id);
 
     ESP_LOGI(TAG, "Uploading weight to %s...", url);
 
@@ -1429,9 +1467,11 @@ void app_main(void)
     }
 #endif
 
+#if DEVICE_MODE == 0
     // Tare on empty board (before WiFi for clean ADC readings)
     hx711_init();
     hx711_read_tare();
+#endif
 
 #if DEVICE_MODE == 1
     ultrasonic_init();
@@ -1460,8 +1500,9 @@ void app_main(void)
         ESP_LOGI(TAG, "Ready — waiting for trigger...");
 
         bool tare_first = false;
+        bool remeasure_baseline = false;
         if (strcmp(g_trigger_mode, "poll") == 0) {
-            while (!wait_for_trigger_poll(&tare_first)) {
+            while (!wait_for_trigger_poll(&tare_first, &remeasure_baseline)) {
                 // server timed out (60s), retry immediately
             }
         } else {
@@ -1471,10 +1512,25 @@ void app_main(void)
             }
         }
 
+#if DEVICE_MODE == 0
         if (tare_first) {
             ESP_LOGI(TAG, ">>> Tare requested — re-taring...");
             hx711_read_tare();
         }
+#endif
+
+#if DEVICE_MODE == 1
+        if (remeasure_baseline) {
+            ESP_LOGI(TAG, ">>> Re-measuring baseline (empty board)...");
+            float new_baseline = ultrasonic_measure();
+            if (new_baseline > 0) {
+                g_baseline_cm = new_baseline;
+                ESP_LOGI(TAG, ">>> New baseline: %.2f cm", g_baseline_cm);
+            } else {
+                ESP_LOGW(TAG, ">>> Baseline re-measure failed, keeping %.2f cm", g_baseline_cm);
+            }
+        }
+#endif
 
         ESP_LOGI(TAG, ">>> Triggered! Refreshing config...");
         if (wifi_ok) fetch_config();
@@ -1482,8 +1538,12 @@ void app_main(void)
         ESP_LOGI(TAG, ">>> Starting measurement...");
 
         // Weigh
+#if DEVICE_MODE == 0
         float weight_g = hx711_read_grams();
         ESP_LOGI(TAG, ">>> Weight: %.1f g", weight_g);
+#else
+        float weight_g = 0.0f;
+#endif
 
 #if DEVICE_MODE == 1
         // Ultrasonic height (baseline was captured at boot)
