@@ -84,8 +84,10 @@ def merge_into(existing, new_entry):
         if new_entry.get(key, 0) != 0:
             existing[key] = new_entry[key]
     for key in ("tare_readings", "weight_readings"):
-        if new_entry.get(key, ""):
-            existing[key] = new_entry[key]
+        val = new_entry.get(key, "")
+        # Only overwrite if new value has actual non-zero readings (mode 1 sends 0,0,0,0,0)
+        if val and any(c in '123456789' for c in val):
+            existing[key] = val
     # Ultrasonic fields: take positive values
     for key in ("baseline_cm", "object_cm"):
         if new_entry.get(key, -1) > 0:
@@ -486,9 +488,18 @@ PAGE_TEMPLATE = """
         <!-- WEIGHT CALIBRATION -->
         <div class="panel">
             <h2 class="amber">Weight Calibration (HX711 ESP32)</h2>
-            <p class="hint" style="margin-bottom:10px;">Place a known weight on the board, trigger a tare+weigh, then enter the actual weight and calibrate.</p>
-            <button class="btn btn-amber" id="btnWeightTrigger" onclick="doTrigger('weight', {tare_first: true})" style="margin-bottom:12px;">
-                &#9654; Tare &amp; Weigh
+            <p class="hint" style="margin-bottom:10px;">
+                <strong>Step 1:</strong> Keep board empty, check "Tare first", click Weigh — ESP32 tares &amp; stores zero reference.<br>
+                <strong>Step 2:</strong> Place known weight, uncheck "Tare first", click Weigh — ESP32 weighs using stored tare.<br>
+                <strong>Step 3:</strong> Enter the actual weight below and click Calibrate.
+            </p>
+            <div class="row" style="margin-bottom:10px;">
+                <label style="cursor:pointer;color:#aaa;font-size:13px;">
+                    <input type="checkbox" id="tareFirst"> Tare first (keep board empty)
+                </label>
+            </div>
+            <button class="btn btn-amber" id="btnWeightTrigger" onclick="doWeightTrigger()" style="margin-bottom:12px;">
+                &#9654; Weigh
             </button>
             <div class="result" id="resultWeightTrigger"></div>
             <hr style="border-color:#333;margin:12px 0;">
@@ -511,7 +522,7 @@ PAGE_TEMPLATE = """
                 <label style="cursor:pointer;color:#aaa;">
                     <input type="checkbox" id="rawCaptureCheck" {% if config.get('raw_capture') %}checked{% endif %} onchange="doSetRawCapture(this.checked)"> Raw capture mode
                 </label>
-                <button class="btn btn-pink" id="btnCapture" onclick="doCaptureRaw()">&#128247; Capture Raw</button>
+                <button class="btn btn-pink" id="btnCapture" onclick="doCaptureRaw()">Capture Raw</button>
             </div>
             <div class="result" id="resultCapture"></div>
             <div class="board-grid">
@@ -694,6 +705,35 @@ PAGE_TEMPLATE = """
         }
     }
 
+    async function doWeightTrigger() {
+        const tareFirst = document.getElementById('tareFirst').checked;
+        const btn = document.getElementById('btnWeightTrigger');
+        const result = document.getElementById('resultWeightTrigger');
+        btn.disabled = true; btn.textContent = '...';
+        result.style.display = 'none';
+        try {
+            const resp = await fetch(API_BASE + '/api/trigger', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({target: 'weight', tare_first: tareFirst})
+            });
+            const data = await resp.json();
+            result.style.display = 'block';
+            if (resp.ok) {
+                result.style.color = '#ffb74d';
+                result.textContent = tareFirst ? 'Taring then weighing (board empty)...' : 'Weighing with stored tare...';
+            } else {
+                result.style.color = '#ef5350';
+                result.textContent = 'Error: ' + data.message;
+            }
+        } catch(e) {
+            result.style.display = 'block';
+            result.style.color = '#ef5350';
+            result.textContent = 'Request failed: ' + e.message;
+        }
+        btn.disabled = false; btn.textContent = '\u25b6 Weigh';
+    }
+
     async function doCaptureRaw() {
         const btn = document.getElementById('btnCapture');
         const result = document.getElementById('resultCapture');
@@ -726,7 +766,7 @@ PAGE_TEMPLATE = """
             result.style.color = '#ef5350';
             result.textContent = 'Request failed: ' + e.message;
         }
-        btn.disabled = false; btn.textContent = '\uD83D\uDCF7 Capture Raw';
+        btn.disabled = false; btn.textContent = '\U0001F4F7 Capture Raw';
     }
 
     async function doDelete(filename) {
