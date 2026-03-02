@@ -1,7 +1,7 @@
 // ============== DEVICE MODE ==============
 // 1 = Camera device (ESP32-CAM): camera + ultrasonic only (no HX711, no PSRAM needed for HX711)
 // 0 = HX711 only: weight measurement + WiFi upload (no camera, no PSRAM needed)
-#define DEVICE_MODE 1
+#define DEVICE_MODE 0
 // =========================================
 
 #include <stdio.h>
@@ -317,6 +317,7 @@ static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
 static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
+static float g_server_ppmm  = PIXELS_PER_MM_REF;  // reference ppmm at baseline distance (from server)
 static int   g_sobel_threshold   = SOBEL_THRESHOLD;
 static int   g_dilation_iters    = DILATION_ITERATIONS;
 static int   g_min_bbox_area_pct = MIN_BBOX_AREA_PCT;
@@ -544,8 +545,10 @@ static void fetch_config(void)
     esp_err_t err = esp_http_client_open(client, 0);
     if (err == ESP_OK) {
         esp_http_client_fetch_headers(client);
-        int data_read = esp_http_client_read(client, body, sizeof(body) - 1);
-        if (data_read > 0) body[data_read] = '\0';
+        int total = 0, n;
+        while ((n = esp_http_client_read(client, body + total, sizeof(body) - 1 - total)) > 0)
+            total += n;
+        body[total] = '\0';
     }
 
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
@@ -590,8 +593,9 @@ static void fetch_config(void)
             while (*ppos == ':' || *ppos == ' ') ppos++;
             float pval = strtof(ppos, NULL);
             if (pval > 0.0f) {
+                g_server_ppmm  = pval;
                 g_dynamic_ppmm = pval;
-                ESP_LOGI(TAG, "pixels_per_mm from server: %.4f", g_dynamic_ppmm);
+                ESP_LOGI(TAG, "pixels_per_mm from server: %.4f", g_server_ppmm);
             }
         }
 
@@ -1590,7 +1594,7 @@ void app_main(void)
         if (g_object_cm > 0 && g_baseline_cm > 0) {
             g_object_height_cm = g_baseline_cm - g_object_cm;
             if (g_object_height_cm < 0) g_object_height_cm = 0;
-            g_dynamic_ppmm = PIXELS_PER_MM_REF * (CALIBRATION_DIST_CM / g_object_cm);
+            g_dynamic_ppmm = g_server_ppmm * (g_baseline_cm / g_object_cm);
             ESP_LOGI(TAG, ">>> Object distance: %.2f cm", g_object_cm);
             ESP_LOGI(TAG, ">>> Object height:   %.2f cm", g_object_height_cm);
             ESP_LOGI(TAG, ">>> Dynamic ppmm:    %.4f (ref %.4f at %.1f cm)",
