@@ -44,7 +44,7 @@
 #define HX711_CAL_FACTOR_DEFAULT 27.93f   // raw units per gram (fallback, calibrated with 3416g)
 static float hx711_cal_factor = HX711_CAL_FACTOR_DEFAULT;
 #endif
-static char g_trigger_mode[8] = "tcp";
+static char g_trigger_mode[8] = "poll";
 static char g_measurement_id[24] = {0};  // shared ID for merging dual-ESP32 uploads
 #if DEVICE_MODE == 1
 static bool g_raw_capture = false;
