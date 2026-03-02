@@ -533,18 +533,20 @@ static void fetch_config(void)
     snprintf(url, sizeof(url), "http://%s:%d%s/api/config", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
 
     char body[512] = {0};
-    http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
 
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_GET,
         .timeout_ms = 5000,
-        .event_handler = http_event_handler,
-        .user_data = &resp,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_err_t err = esp_http_client_perform(client);
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err == ESP_OK) {
+        esp_http_client_fetch_headers(client);
+        int data_read = esp_http_client_read(client, body, sizeof(body) - 1);
+        if (data_read > 0) body[data_read] = '\0';
+    }
 
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
 #if DEVICE_MODE == 0
