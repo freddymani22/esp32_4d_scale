@@ -34,7 +34,12 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
             return json.load(f)
-    return {"cal_factor": DEFAULT_CAL_FACTOR}
+    return {
+        "cal_factor": DEFAULT_CAL_FACTOR,
+        "sobel_threshold": 60,
+        "dilation_iterations": 1,
+        "min_bbox_area_pct": 2,
+    }
 
 
 def save_config(cfg):
@@ -183,6 +188,9 @@ def get_config():
         "board_p2x": cfg.get("board_p2x", 195), "board_p2y": cfg.get("board_p2y", 160),
         "board_p3x": cfg.get("board_p3x", 50),  "board_p3y": cfg.get("board_p3y", 160),
         "pixels_per_mm": cfg.get("pixels_per_mm", 0.1644),
+        "sobel_threshold": cfg.get("sobel_threshold", 60),
+        "dilation_iterations": cfg.get("dilation_iterations", 1),
+        "min_bbox_area_pct": cfg.get("min_bbox_area_pct", 2),
     }
 
 
@@ -230,9 +238,13 @@ def set_board_crop():
             cfg[key] = int(body[key])
     if "pixels_per_mm" in body:
         cfg["pixels_per_mm"] = round(float(body["pixels_per_mm"]), 4)
+    for key in ("sobel_threshold", "dilation_iterations", "min_bbox_area_pct"):
+        if key in body:
+            cfg[key] = int(body[key])
     save_config(cfg)
     pt_keys = ["board_p0x","board_p0y","board_p1x","board_p1y",
-               "board_p2x","board_p2y","board_p3x","board_p3y","raw_capture","pixels_per_mm"]
+               "board_p2x","board_p2y","board_p3x","board_p3y","raw_capture","pixels_per_mm",
+               "sobel_threshold","dilation_iterations","min_bbox_area_pct"]
     return {"status": "ok", "config": {k: cfg[k] for k in pt_keys if k in cfg}}
 
 
@@ -560,6 +572,18 @@ PAGE_TEMPLATE = """
                 <input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:90px;">
                 <button class="btn btn-pink" onclick="doSaveCrop()">Save Corners</button>
             </div>
+            <div class="row">
+                <label>Sobel Threshold:</label>
+                <input type="number" id="bsobel" value="{{ config.get('sobel_threshold', 60) }}" min="0" max="2040" step="10" style="width:90px;">
+            </div>
+            <div class="row">
+                <label>Dilation Iters:</label>
+                <input type="number" id="bdilation" value="{{ config.get('dilation_iterations', 1) }}" min="1" max="5" step="1" style="width:90px;">
+            </div>
+            <div class="row">
+                <label>Min BBox Area %:</label>
+                <input type="number" id="bminbbox" value="{{ config.get('min_bbox_area_pct', 2) }}" min="1" max="10" step="1" style="width:90px;">
+            </div>
             <div class="hint" style="margin-top:6px;">Image is 320×240. x, y per corner.</div>
             <div class="result" id="resultCrop"></div>
         </div>
@@ -830,6 +854,9 @@ PAGE_TEMPLATE = """
             board_p3x: parseInt(document.getElementById('bp3x').value),
             board_p3y: parseInt(document.getElementById('bp3y').value),
             pixels_per_mm: parseFloat(document.getElementById('bppmm').value),
+            sobel_threshold: parseInt(document.getElementById('bsobel').value),
+            dilation_iterations: parseInt(document.getElementById('bdilation').value),
+            min_bbox_area_pct: parseInt(document.getElementById('bminbbox').value),
         };
         const resp = await fetch(API_BASE + '/api/set_board_crop', {
             method: 'POST',

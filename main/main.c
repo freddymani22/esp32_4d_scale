@@ -76,7 +76,7 @@ static const char *TAG = "measure";
 
 #if DEVICE_MODE == 1
 // ============== CONFIGURATION ==============
-#define SOBEL_THRESHOLD     60      // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
+#define SOBEL_THRESHOLD     120      // Edge magnitude threshold (0-2040). Increase to ignore weaker edges like shadows
 #define DILATION_ITERATIONS 1       // Close edge gaps after Sobel (increase if contour has breaks)
 #define MAX_CONTOUR_POINTS  5000    // Max points in contour
 #define MAX_CONTOUR_SEARCH  10      // Max contours to evaluate before picking the largest
@@ -317,6 +317,9 @@ static float g_baseline_cm = -1.0f;  // distance to empty surface
 static float g_object_cm = -1.0f;    // distance to object top
 static float g_object_height_cm = 0.0f;
 static float g_dynamic_ppmm = PIXELS_PER_MM_REF;
+static int   g_sobel_threshold   = SOBEL_THRESHOLD;
+static int   g_dilation_iters    = DILATION_ITERATIONS;
+static int   g_min_bbox_area_pct = MIN_BBOX_AREA_PCT;
 
 // ============== ULTRASONIC SENSOR ==============
 
@@ -529,7 +532,7 @@ static void fetch_config(void)
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%d%s/api/config", SERVER_IP, SERVER_PORT, SERVER_PATH_PREFIX);
 
-    char body[256] = {0};
+    char body[512] = {0};
     http_response_t resp = { .buf = body, .len = 0, .capacity = sizeof(body) - 1 };
 
     esp_http_client_config_t config = {
@@ -618,6 +621,39 @@ static void fetch_config(void)
         ESP_LOGI(TAG, "Board pts: (%d,%d) (%d,%d) (%d,%d) (%d,%d)",
                  g_board_pts[0][0], g_board_pts[0][1], g_board_pts[1][0], g_board_pts[1][1],
                  g_board_pts[2][0], g_board_pts[2][1], g_board_pts[3][0], g_board_pts[3][1]);
+
+        // Parse sobel_threshold
+        const char *stkey = "\"sobel_threshold\"";
+        char *stpos = strstr(body, stkey);
+        if (stpos) {
+            stpos += strlen(stkey);
+            while (*stpos == ':' || *stpos == ' ') stpos++;
+            int stval = (int)strtol(stpos, NULL, 10);
+            if (stval > 0) { g_sobel_threshold = stval; }
+        }
+
+        // Parse dilation_iterations
+        const char *dikey = "\"dilation_iterations\"";
+        char *dipos = strstr(body, dikey);
+        if (dipos) {
+            dipos += strlen(dikey);
+            while (*dipos == ':' || *dipos == ' ') dipos++;
+            int dival = (int)strtol(dipos, NULL, 10);
+            if (dival > 0) { g_dilation_iters = dival; }
+        }
+
+        // Parse min_bbox_area_pct
+        const char *mbkey = "\"min_bbox_area_pct\"";
+        char *mbpos = strstr(body, mbkey);
+        if (mbpos) {
+            mbpos += strlen(mbkey);
+            while (*mbpos == ':' || *mbpos == ' ') mbpos++;
+            int mbval = (int)strtol(mbpos, NULL, 10);
+            if (mbval > 0) { g_min_bbox_area_pct = mbval; }
+        }
+
+        ESP_LOGI(TAG, "Image params: sobel=%d dilation=%d min_bbox_pct=%d",
+                 g_sobel_threshold, g_dilation_iters, g_min_bbox_area_pct);
 #endif // DEVICE_MODE == 1
 
         // Parse trigger_mode
@@ -1057,12 +1093,12 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
     }
 
     // Step 1: Sobel edge detection on cropped image
-    ESP_LOGI(TAG, "Step 1: Sobel edge detection on crop %dx%d (threshold=%d)...", cw, ch, SOBEL_THRESHOLD);
-    apply_sobel(crop, binary, cw, ch, SOBEL_THRESHOLD);
+    ESP_LOGI(TAG, "Step 1: Sobel edge detection on crop %dx%d (threshold=%d)...", cw, ch, g_sobel_threshold);
+    apply_sobel(crop, binary, cw, ch, g_sobel_threshold);
 
     // Step 1.5: Dilation to close edge gaps
-    ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", DILATION_ITERATIONS);
-    apply_dilation(binary, cw, ch, DILATION_ITERATIONS);
+    ESP_LOGI(TAG, "Step 1.5: Closing edge gaps (dilation=%d)...", g_dilation_iters);
+    apply_dilation(binary, cw, ch, g_dilation_iters);
 
     // Step 1.75: Polygon mask — zero edge pixels outside the board quadrilateral
     // Uses ray-casting point-in-polygon test (works for any convex/concave polygon)
@@ -1093,7 +1129,7 @@ static min_area_rect_t process_image(uint8_t *grayscale, int width, int height, 
     ESP_LOGI(TAG, "  Masked %d edge pixels outside polygon", masked);
 
     // Step 2: Trace contours and pick the largest
-    int min_bbox_area = (cw * ch * MIN_BBOX_AREA_PCT) / 100;
+    int min_bbox_area = (cw * ch * g_min_bbox_area_pct) / 100;
     int max_bbox_area = cw * ch * 80 / 100;  // Skip contours covering >80% of crop (board boundary)
     ESP_LOGI(TAG, "Step 2: Tracing contours (up to %d, min_area=%d)...", MAX_CONTOUR_SEARCH, min_bbox_area);
     int best_contour_count = 0;
