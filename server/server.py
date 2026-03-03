@@ -1,4 +1,5 @@
-from flask import Flask, request, send_from_directory, render_template_string
+from flask import Flask, request, send_from_directory, render_template_string, session, redirect, url_for
+from functools import wraps
 import os
 import json
 import threading
@@ -22,12 +23,43 @@ tcp_client_conn = None
 tcp_client_lock = threading.Lock()
 
 app = Flask(__name__)
+app.secret_key = "4dscale-secret-key-change-me"
+AUTH_USERNAME = "admin"
+AUTH_PASSWORD = "scale1234"
+
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 DATA_FILE = os.path.join(os.path.dirname(__file__), "uploads", "measurements.json")
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "uploads", "config.json")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 DEFAULT_CAL_FACTOR = 29.46
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        if (request.form.get("username") == AUTH_USERNAME and
+                request.form.get("password") == AUTH_PASSWORD):
+            session["logged_in"] = True
+            return redirect(request.args.get("next") or "/")
+        error = "Invalid username or password."
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 def load_config():
@@ -196,6 +228,7 @@ def get_config():
 
 # User submits known weight to calibrate
 @app.route("/api/calibrate", methods=["POST"])
+@login_required
 def calibrate():
     body = request.get_json()
     if not body or "known_weight_g" not in body:
@@ -225,6 +258,7 @@ def calibrate():
 
 # Save board crop coordinates + raw_capture flag
 @app.route("/api/set_board_crop", methods=["POST"])
+@login_required
 def set_board_crop():
     body = request.get_json()
     if not body:
@@ -250,6 +284,7 @@ def set_board_crop():
 
 # Delete measurements within a date range (inclusive)
 @app.route("/api/delete_range", methods=["POST"])
+@login_required
 def delete_range():
     body = request.get_json()
     if not body or "from_date" not in body or "to_date" not in body:
@@ -277,6 +312,7 @@ def delete_range():
 
 # Delete a measurement and its image
 @app.route("/api/delete", methods=["POST"])
+@login_required
 def delete_measurement():
     body = request.get_json()
     if not body or "filename" not in body:
@@ -294,6 +330,7 @@ def delete_measurement():
 
 # Save trigger mode
 @app.route("/api/set_trigger_mode", methods=["POST"])
+@login_required
 def set_trigger_mode():
     body = request.get_json()
     if not body or "trigger_mode" not in body:
@@ -309,6 +346,7 @@ def set_trigger_mode():
 
 # Save baseline distance
 @app.route("/api/set_baseline", methods=["POST"])
+@login_required
 def set_baseline():
     body = request.get_json()
     if not body or "baseline_cm" not in body:
@@ -327,6 +365,7 @@ def set_baseline():
 # tare_first: bool — re-tare before weighing (weight target)
 # remeasure_baseline: bool — re-measure empty board distance (camera target)
 @app.route("/api/trigger", methods=["POST"])
+@login_required
 def trigger():
     global poll_tare_first, poll_remeasure_baseline
     global pending_measurement_id_mode0, pending_measurement_id_mode1
@@ -393,6 +432,7 @@ def wait_trigger():
 
 # View results in browser
 @app.route("/")
+@login_required
 def index():
     measurements = load_measurements()
     cfg = load_config()
@@ -403,6 +443,44 @@ def index():
 def serve_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
+
+LOGIN_TEMPLATE = """
+<html>
+<head>
+    <title>ESP32 4D Scale — Login</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', monospace; background: #0f0f0f; color: #e0e0e0;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .box { background: #1a1a1a; border: 1px solid #333; border-radius: 10px; padding: 36px 40px; width: 320px; }
+        h1 { color: #4fc3f7; font-size: 20px; margin-bottom: 6px; }
+        .sub { color: #888; font-size: 12px; margin-bottom: 24px; }
+        label { color: #aaa; font-size: 13px; display: block; margin-bottom: 6px; }
+        input { width: 100%; background: #222; border: 1px solid #444; border-radius: 6px;
+                color: #fff; padding: 9px 12px; font-size: 14px; margin-bottom: 16px; }
+        input:focus { outline: none; border-color: #4fc3f7; }
+        button { width: 100%; background: #4fc3f7; color: #000; border: none; border-radius: 6px;
+                 padding: 10px; font-size: 14px; font-weight: bold; cursor: pointer; }
+        button:hover { background: #29b6f6; }
+        .error { color: #ef5350; font-size: 13px; margin-bottom: 14px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>ESP32 4D Scale</h1>
+        <p class="sub">Sign in to continue</p>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <label>Username</label>
+            <input type="text" name="username" autofocus autocomplete="username">
+            <label>Password</label>
+            <input type="password" name="password" autocomplete="current-password">
+            <button type="submit">Sign In</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
 
 PAGE_TEMPLATE = """
 <html>
@@ -490,7 +568,10 @@ PAGE_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>ESP32 4D Scale</h1>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <h1>ESP32 4D Scale</h1>
+        <a href="/logout" style="color:#888;font-size:12px;text-decoration:none;border:1px solid #333;border-radius:6px;padding:4px 12px;">Logout</a>
+    </div>
     <p class="subtitle">{{ measurements|length }} measurement{{ 's' if measurements|length != 1 }} captured</p>
 
     <div class="panels">
