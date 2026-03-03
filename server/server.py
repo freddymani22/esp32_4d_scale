@@ -601,20 +601,70 @@ PAGE_TEMPLATE = """
             text-transform: uppercase; color: var(--t3); margin-bottom: 12px;
         }
 
-        /* ── Panels ── */
-        .panels { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; margin-bottom: 28px; }
-        .panel {
-            background: var(--surface); border: 1px solid var(--border);
-            border-radius: var(--r); padding: 20px;
-            position: relative; overflow: hidden;
-            transition: border-color 0.2s;
+        /* ── Hero measure section ── */
+        .hero-sec {
+            background: linear-gradient(135deg, #0d0d1f 0%, #111228 100%);
+            border: 1px solid var(--border); border-radius: var(--r);
+            padding: 28px 32px; margin-bottom: 20px;
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 24px; flex-wrap: wrap; position: relative; overflow: hidden;
         }
-        .panel:hover { border-color: var(--border-h); }
-        .panel::after {
+        .hero-sec::after {
             content: ''; position: absolute;
             top: 0; left: 0; right: 0; height: 1px;
+            background: linear-gradient(90deg, var(--blue) 0%, var(--purple) 60%, transparent 100%);
         }
-        .panel.blue::after  { background: linear-gradient(90deg, var(--blue) 0%, transparent 70%); }
+        .hero-info { flex: 1; min-width: 180px; }
+        .hero-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+        .hero-desc  { font-size: 12px; color: var(--t2); line-height: 1.6; }
+        .hero-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .btn-hero {
+            border: none; border-radius: var(--rs); padding: 13px 32px;
+            font-size: 15px; font-weight: 700; cursor: pointer;
+            font-family: 'Inter', sans-serif; transition: all 0.15s;
+            display: inline-flex; align-items: center; gap: 8px;
+            background: var(--blue); color: #000;
+        }
+        .btn-hero:not(:disabled):hover { background: #7dd3fc; transform: translateY(-2px); box-shadow: 0 8px 28px var(--blue-g); }
+        .btn-hero:disabled { opacity: 0.35; cursor: not-allowed; }
+
+        /* ── Accordion ── */
+        .accord {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r); margin-bottom: 20px; overflow: hidden;
+        }
+        .accord-hdr {
+            display: flex; align-items: center; gap: 10px;
+            padding: 14px 20px; cursor: pointer; list-style: none;
+            font-size: 12px; font-weight: 600; color: var(--t2);
+            user-select: none; transition: background 0.15s;
+        }
+        .accord-hdr::-webkit-details-marker { display: none; }
+        .accord-hdr:hover { background: var(--surface2); color: var(--t1); }
+        .accord-arrow {
+            margin-left: auto; font-size: 11px; color: var(--t3);
+            transition: transform 0.2s;
+        }
+        details[open] .accord-arrow { transform: rotate(180deg); }
+        .accord-ico {
+            width: 24px; height: 24px; border-radius: 6px;
+            display: flex; align-items: center; justify-content: center; font-size: 12px;
+            background: var(--surface2);
+        }
+        .accord-body {
+            border-top: 1px solid var(--border);
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 0;
+        }
+        .panel {
+            padding: 20px; position: relative;
+            border-right: 1px solid var(--border);
+        }
+        .panel:last-child { border-right: none; }
+        .panel::after {
+            content: ''; position: absolute;
+            top: 0; left: 0; right: 0; height: 2px;
+        }
         .panel.green::after { background: linear-gradient(90deg, var(--green) 0%, transparent 70%); }
         .panel.amber::after { background: linear-gradient(90deg, var(--amber) 0%, transparent 70%); }
         .panel.pink::after  { background: linear-gradient(90deg, var(--pink) 0%, transparent 70%); }
@@ -623,12 +673,10 @@ PAGE_TEMPLATE = """
             width: 30px; height: 30px; border-radius: 7px;
             display: flex; align-items: center; justify-content: center; font-size: 14px;
         }
-        .panel.blue  .pico { background: var(--blue-g);  color: var(--blue); }
         .panel.green .pico { background: var(--green-g); color: var(--green); }
         .panel.amber .pico { background: var(--amber-g); color: var(--amber); }
         .panel.pink  .pico { background: var(--pink-g);  color: var(--pink); }
         .ptitle { font-size: 13px; font-weight: 700; }
-        .panel.blue  .ptitle { color: var(--blue); }
         .panel.green .ptitle { color: var(--green); }
         .panel.amber .ptitle { color: var(--amber); }
         .panel.pink  .ptitle { color: var(--pink); }
@@ -749,8 +797,10 @@ PAGE_TEMPLATE = """
         .empty-icon { font-size: 40px; opacity: 0.25; display: block; margin-bottom: 14px; }
 
         @media (max-width: 900px) {
-            .panels { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-            .grid   { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+            .accord-body { grid-template-columns: 1fr; }
+            .panel { border-right: none; border-bottom: 1px solid var(--border); }
+            .panel:last-child { border-bottom: none; }
+            .grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
         }
         @media (max-width: 600px) {
             .hdr { padding: 0 12px; height: 52px; }
@@ -758,7 +808,10 @@ PAGE_TEMPLATE = """
             .logo { width: 28px; height: 28px; font-size: 11px; border-radius: 7px; }
             .hdr-title { font-size: 13px; }
             .wrap { padding: 12px; }
-            .panels, .grid { grid-template-columns: 1fr; }
+            .hero-sec { padding: 20px 16px; }
+            .hero-title { font-size: 16px; }
+            .btn-hero { width: 100%; justify-content: center; }
+            .accord-body, .grid { grid-template-columns: 1fr; }
             .board-grid { grid-template-columns: 1fr 1fr; }
             .board-cell input { width: 44px !important; font-size: 10px !important; }
             .del-bar { flex-direction: column; align-items: flex-start; gap: 8px; }
@@ -786,16 +839,27 @@ PAGE_TEMPLATE = """
 </header>
 
 <div class="wrap">
-    <p class="sec-label">Controls</p>
-    <div class="panels">
 
-        <!-- MEASURE -->
-        <div class="panel blue">
-            <div class="ph"><div class="pico">&#9654;</div><div class="ptitle">Trigger Measurement</div></div>
-            <p class="pdesc">Captures dimensions (L×W×H) and measures weight in a single operation.</p>
-            <button class="btn btn-blue" id="btnMeasure" onclick="doTrigger('both')">&#9654;&nbsp; Measure Now</button>
-            <div class="result" id="resultMeasure"></div>
+    <!-- HERO MEASURE -->
+    <div class="hero-sec">
+        <div class="hero-info">
+            <div class="hero-title">&#9654;&nbsp; Measure</div>
+            <div class="hero-desc">Captures dimensions (L×W×H) and measures weight in a single operation.</div>
         </div>
+        <div class="hero-actions">
+            <button class="btn-hero" id="btnMeasure" onclick="doTrigger('both')">&#9654;&nbsp; Measure Now</button>
+        </div>
+        <div class="result" id="resultMeasure" style="width:100%;margin-top:0;"></div>
+    </div>
+
+    <!-- CALIBRATION ACCORDION -->
+    <details class="accord">
+        <summary class="accord-hdr">
+            <span class="accord-ico">&#9881;</span>
+            <span>Calibration Settings</span>
+            <span class="accord-arrow">&#9660;</span>
+        </summary>
+        <div class="accord-body">
 
         <!-- BASELINE -->
         <div class="panel green">
@@ -887,7 +951,8 @@ PAGE_TEMPLATE = """
             <div class="result" id="resultCrop"></div>
         </div>
 
-    </div>
+        </div><!-- end accord-body -->
+    </details><!-- end accord -->
 
     <!-- DELETE BAR -->
     <div class="del-bar">
