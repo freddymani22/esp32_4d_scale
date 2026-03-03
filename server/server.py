@@ -518,7 +518,7 @@ LOGIN_TEMPLATE = """
         <div class="logo">4D</div>
         <div class="logo-text">
             <div class="logo-title">4D Scale Dashboard</div>
-            <div class="logo-sub">ESP32 Measurement System</div>
+            <div class="logo-sub">4D Measurement System</div>
         </div>
     </div>
     <div class="card">
@@ -776,7 +776,7 @@ PAGE_TEMPLATE = """
         <div class="logo">4D</div>
         <div>
             <div class="hdr-title">4D Scale Dashboard</div>
-            <div class="hdr-sub">ESP32 Measurement System</div>
+            <div class="hdr-sub">4D Measurement System</div>
         </div>
     </div>
     <div class="hdr-r">
@@ -792,7 +792,7 @@ PAGE_TEMPLATE = """
         <!-- MEASURE -->
         <div class="panel blue">
             <div class="ph"><div class="pico">&#9654;</div><div class="ptitle">Trigger Measurement</div></div>
-            <p class="pdesc">Fires both ESP32s — camera captures L×W×H, HX711 measures weight.</p>
+            <p class="pdesc">Captures dimensions (L×W×H) and measures weight in a single operation.</p>
             <button class="btn btn-blue" id="btnMeasure" onclick="doTrigger('both')">&#9654;&nbsp; Measure Now</button>
             <div class="result" id="resultMeasure"></div>
         </div>
@@ -904,7 +904,7 @@ PAGE_TEMPLATE = """
     {% if not measurements %}
     <div class="empty">
         <span class="empty-icon">&#128202;</span>
-        Waiting for ESP32 to upload results...
+        Waiting for measurements to appear...
     </div>
     {% endif %}
 
@@ -1026,9 +1026,9 @@ PAGE_TEMPLATE = """
                 if (resp.ok) {
                     result.style.color = '#81c784';
                     const msgs = {
-                        both: 'Triggered both ESP32s — measuring...',
-                        camera: 'Triggered camera ESP32...',
-                        weight: 'Triggered HX711 ESP32 — taring then weighing...'
+                        both: 'Measurement triggered — please wait...',
+                        camera: 'Capturing dimensions...',
+                        weight: 'Taring and weighing...'
                     };
                     result.textContent = msgs[target] || 'Triggered.';
                 } else {
