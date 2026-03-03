@@ -679,15 +679,39 @@ PAGE_TEMPLATE = """
         .dim-sub { color: var(--t3); font-size: 10px; margin-top: 2px; }
         .raw { font-size: 10px; color: var(--t3); font-family: 'Courier New', monospace;
                background: var(--surface2); padding: 5px 8px; border-radius: 5px; margin-bottom: 4px; }
+        .raw-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr);
+            gap: 5px; margin-bottom: 8px;
+        }
+        .raw-cell {
+            background: var(--surface2); border: 1px solid var(--border);
+            border-radius: var(--rs); padding: 6px 8px; text-align: center;
+        }
+        .raw-cell .rc-lbl { font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--t3); margin-bottom: 3px; }
+        .raw-cell .rc-val { font-size: 12px; font-weight: 600; font-family: 'Courier New', monospace; color: var(--t2); }
         .card-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
         .empty { text-align: center; padding: 80px 20px; color: var(--t3); }
         .empty-icon { font-size: 40px; opacity: 0.25; display: block; margin-bottom: 14px; }
 
-        @media (max-width: 700px) {
-            .hdr { padding: 0 14px; }
-            .wrap { padding: 14px; }
-            .panels, .grid { grid-template-columns: 1fr; }
+        @media (max-width: 900px) {
+            .panels { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+            .grid   { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+        }
+        @media (max-width: 600px) {
+            .hdr { padding: 0 12px; height: 52px; }
             .hdr-sub, .chip { display: none; }
+            .logo { width: 28px; height: 28px; font-size: 11px; border-radius: 7px; }
+            .hdr-title { font-size: 13px; }
+            .wrap { padding: 12px; }
+            .panels, .grid { grid-template-columns: 1fr; }
+            .board-grid { grid-template-columns: 1fr 1fr; }
+            .board-cell input { width: 44px !important; font-size: 10px !important; }
+            .del-bar { flex-direction: column; align-items: flex-start; gap: 8px; }
+            .del-bar input[type=date] { width: 100%; }
+            .dims { grid-template-columns: repeat(3, 1fr); gap: 5px; }
+            .dim-value { font-size: 13px; }
+            .raw-grid { grid-template-columns: repeat(2, 1fr); }
+            .row label { min-width: 90px; }
         }
     </style>
 </head>
@@ -799,11 +823,12 @@ PAGE_TEMPLATE = """
                     </div>
                 </div>
             </div>
-            <div class="row"><label>Pixels/mm</label><input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:85px;"><button class="btn btn-pink" onclick="doSaveCrop()">&#10003; Save All</button></div>
+            <div class="row"><label>Pixels/mm</label><input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:85px;"></div>
             <div class="row"><label>Sobel Threshold</label><input type="number" id="bsobel" value="{{ config.get('sobel_threshold', 60) }}" min="0" max="2040" step="10" style="width:80px;"></div>
             <div class="row"><label>Dilation Iters</label><input type="number" id="bdilation" value="{{ config.get('dilation_iterations', 1) }}" min="1" max="5" style="width:80px;"></div>
             <div class="row"><label>Min BBox Area %</label><input type="number" id="bminbbox" value="{{ config.get('min_bbox_area_pct', 2) }}" min="1" max="10" style="width:80px;"></div>
             <div class="hint">Image 320×240 px &middot; x, y per corner</div>
+            <button class="btn btn-pink" onclick="doSaveCrop()" style="width:100%;margin-top:10px;justify-content:center;">&#10003;&nbsp; Save All</button>
             <div class="result" id="resultCrop"></div>
         </div>
 
@@ -894,9 +919,26 @@ PAGE_TEMPLATE = """
                     </div>
                     {% endif %}
                 </div>
-                <div class="raw">tare: {{ m.raw_tare }} &nbsp;|&nbsp; avg: {{ m.raw_avg }} &nbsp;|&nbsp; diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} &nbsp;|&nbsp; ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
-                {% if m.get('tare_readings') %}<div class="raw">tare: {{ m.tare_readings }}</div>{% endif %}
-                {% if m.get('weight_readings') %}<div class="raw">weight: {{ m.weight_readings }}</div>{% endif %}
+                <div class="raw-grid">
+                    <div class="raw-cell">
+                        <div class="rc-lbl">Tare</div>
+                        <div class="rc-val">{{ m.raw_tare }}</div>
+                    </div>
+                    <div class="raw-cell">
+                        <div class="rc-lbl">Avg</div>
+                        <div class="rc-val">{{ m.raw_avg }}</div>
+                    </div>
+                    <div class="raw-cell">
+                        <div class="rc-lbl">Diff</div>
+                        <div class="rc-val" style="color:var(--blue);">{{ (m.raw_avg - m.raw_tare)|abs }}</div>
+                    </div>
+                    <div class="raw-cell">
+                        <div class="rc-lbl">ppmm</div>
+                        <div class="rc-val" style="color:var(--purple);">{% if m.get('pixels_per_mm', 0) > 0 %}{{ "%.4f"|format(m.pixels_per_mm) }}{% else %}—{% endif %}</div>
+                    </div>
+                </div>
+                {% if m.get('tare_readings') %}<div class="raw">tare readings: {{ m.tare_readings }}</div>{% endif %}
+                {% if m.get('weight_readings') %}<div class="raw">weight readings: {{ m.weight_readings }}</div>{% endif %}
                 <div class="card-foot">
                     <button onclick="doDelete('{{ m.image }}')" class="btn btn-red" style="padding:4px 10px;font-size:11px;">&#128465; Delete</button>
                 </div>
