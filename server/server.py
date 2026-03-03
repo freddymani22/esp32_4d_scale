@@ -447,35 +447,90 @@ def serve_file(filename):
 LOGIN_TEMPLATE = """
 <html>
 <head>
-    <title>ESP32 4D Scale — Login</title>
+    <title>4D Scale — Sign In</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg: #07070f; --surface: #0f0f1c; --surface2: #161628;
+            --border: rgba(255,255,255,0.07); --border-h: rgba(255,255,255,0.14);
+            --blue: #38bdf8; --blue-g: rgba(56,189,248,0.12);
+            --red: #f87171;
+            --t1: #f1f5f9; --t2: #94a3b8; --t3: #475569;
+            --r: 12px; --rs: 8px;
+        }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', monospace; background: #0f0f0f; color: #e0e0e0;
-               display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-        .box { background: #1a1a1a; border: 1px solid #333; border-radius: 10px; padding: 36px 40px; width: 320px; }
-        h1 { color: #4fc3f7; font-size: 20px; margin-bottom: 6px; }
-        .sub { color: #888; font-size: 12px; margin-bottom: 24px; }
-        label { color: #aaa; font-size: 13px; display: block; margin-bottom: 6px; }
-        input { width: 100%; background: #222; border: 1px solid #444; border-radius: 6px;
-                color: #fff; padding: 9px 12px; font-size: 14px; margin-bottom: 16px; }
-        input:focus { outline: none; border-color: #4fc3f7; }
-        button { width: 100%; background: #4fc3f7; color: #000; border: none; border-radius: 6px;
-                 padding: 10px; font-size: 14px; font-weight: bold; cursor: pointer; }
-        button:hover { background: #29b6f6; }
-        .error { color: #ef5350; font-size: 13px; margin-bottom: 14px; }
+        body {
+            font-family: 'Inter', sans-serif; background: var(--bg); color: var(--t1);
+            min-height: 100vh; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; padding: 20px;
+        }
+        .logo-wrap {
+            display: flex; align-items: center; gap: 12px; margin-bottom: 32px;
+        }
+        .logo {
+            width: 40px; height: 40px; border-radius: 11px;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 16px; font-weight: 800; color: #000; letter-spacing: -1px;
+        }
+        .logo-text { }
+        .logo-title { font-size: 17px; font-weight: 700; }
+        .logo-sub { font-size: 11px; color: var(--t3); margin-top: 1px; }
+        .card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r); padding: 32px 28px; width: 100%; max-width: 360px;
+            position: relative; overflow: hidden;
+        }
+        .card::after {
+            content: ''; position: absolute;
+            top: 0; left: 0; right: 0; height: 1px;
+            background: linear-gradient(90deg, var(--blue) 0%, transparent 70%);
+        }
+        .card-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+        .card-sub { font-size: 12px; color: var(--t3); margin-bottom: 24px; }
+        .field-label {
+            display: block; font-size: 12px; font-weight: 500;
+            color: var(--t2); margin-bottom: 6px;
+        }
+        input[type=text], input[type=password] {
+            width: 100%; background: var(--surface2); border: 1px solid var(--border);
+            border-radius: var(--rs); color: var(--t1);
+            padding: 9px 12px; font-size: 13px; font-family: 'Inter', sans-serif;
+            margin-bottom: 16px; transition: border-color 0.2s;
+        }
+        input:focus { outline: none; border-color: var(--blue); }
+        .btn-submit {
+            width: 100%; background: var(--blue); color: #000;
+            border: none; border-radius: var(--rs); padding: 10px;
+            font-size: 13px; font-weight: 700; cursor: pointer;
+            font-family: 'Inter', sans-serif; transition: all 0.15s;
+        }
+        .btn-submit:hover { background: #7dd3fc; transform: translateY(-1px); box-shadow: 0 6px 20px var(--blue-g); }
+        .error {
+            font-size: 12px; color: var(--red); margin-bottom: 16px;
+            background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2);
+            border-radius: var(--rs); padding: 8px 12px;
+        }
     </style>
 </head>
 <body>
-    <div class="box">
-        <h1>ESP32 4D Scale</h1>
-        <p class="sub">Sign in to continue</p>
+    <div class="logo-wrap">
+        <div class="logo">4D</div>
+        <div class="logo-text">
+            <div class="logo-title">4D Scale Dashboard</div>
+            <div class="logo-sub">ESP32 Measurement System</div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-title">Sign in</div>
+        <div class="card-sub">Enter your credentials to continue</div>
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
         <form method="POST">
-            <label>Username</label>
+            <label class="field-label">Username</label>
             <input type="text" name="username" autofocus autocomplete="username">
-            <label>Password</label>
+            <label class="field-label">Password</label>
             <input type="password" name="password" autocomplete="current-password">
-            <button type="submit">Sign In</button>
+            <button type="submit" class="btn-submit">Sign In</button>
         </form>
     </div>
 </body>
