@@ -1,7 +1,7 @@
 // ============== DEVICE MODE ==============
 // 1 = Camera device (ESP32-CAM): camera + ultrasonic only (no HX711, no PSRAM needed for HX711)
 // 0 = HX711 only: weight measurement + WiFi upload (no camera, no PSRAM needed)
-#define DEVICE_MODE 0
+#define DEVICE_MODE 1
 // =========================================
 
 #include <stdio.h>

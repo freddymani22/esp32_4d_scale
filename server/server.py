@@ -485,319 +485,426 @@ LOGIN_TEMPLATE = """
 PAGE_TEMPLATE = """
 <html>
 <head>
-    <title>ESP32 4D Scale</title>
+    <title>4D Scale Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg: #07070f;
+            --surface: #0f0f1c;
+            --surface2: #161628;
+            --surface3: #1e1e35;
+            --border: rgba(255,255,255,0.07);
+            --border-h: rgba(255,255,255,0.14);
+            --blue: #38bdf8; --blue-g: rgba(56,189,248,0.12);
+            --green: #4ade80; --green-g: rgba(74,222,128,0.12);
+            --amber: #fbbf24; --amber-g: rgba(251,191,36,0.12);
+            --pink: #f472b6; --pink-g: rgba(244,114,182,0.12);
+            --red: #f87171;
+            --purple: #a78bfa;
+            --orange: #fb923c;
+            --t1: #f1f5f9; --t2: #94a3b8; --t3: #475569;
+            --r: 12px; --rs: 8px;
+        }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', monospace; background: #0f0f0f; color: #e0e0e0; padding: 24px; }
-        h1 { color: #4fc3f7; margin-bottom: 4px; font-size: 22px; }
-        .subtitle { color: #888; margin-bottom: 24px; font-size: 13px; }
-        .panels { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--t1); min-height: 100vh; }
+
+        /* ── Header ── */
+        .hdr {
+            background: linear-gradient(135deg, #0d0d1f 0%, #13102a 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 0 28px; height: 60px;
+            display: flex; align-items: center; justify-content: space-between;
+            position: sticky; top: 0; z-index: 100;
+        }
+        .hdr-l { display: flex; align-items: center; gap: 12px; }
+        .logo {
+            width: 34px; height: 34px; border-radius: 9px;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 14px; font-weight: 800; color: #000; letter-spacing: -1px;
+        }
+        .hdr-title { font-size: 15px; font-weight: 700; }
+        .hdr-sub { font-size: 11px; color: var(--t3); margin-top: 1px; }
+        .hdr-r { display: flex; align-items: center; gap: 10px; }
+        .chip {
+            background: var(--surface2); border: 1px solid var(--border);
+            border-radius: 20px; padding: 4px 12px;
+            font-size: 11px; color: var(--t2);
+        }
+        .chip b { color: var(--blue); }
+        .logout {
+            color: var(--t2); font-size: 12px; text-decoration: none;
+            border: 1px solid var(--border); border-radius: var(--rs);
+            padding: 5px 13px; transition: all 0.2s; font-family: 'Inter', sans-serif;
+        }
+        .logout:hover { color: var(--t1); border-color: var(--border-h); }
+
+        /* ── Layout ── */
+        .wrap { padding: 24px 28px; max-width: 1440px; margin: 0 auto; }
+        .sec-label {
+            font-size: 10px; font-weight: 700; letter-spacing: 1.8px;
+            text-transform: uppercase; color: var(--t3); margin-bottom: 12px;
+        }
+
+        /* ── Panels ── */
+        .panels { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; margin-bottom: 28px; }
         .panel {
-            background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
-            padding: 20px; flex: 1 1 320px; max-width: 480px;
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r); padding: 20px;
+            position: relative; overflow: hidden;
+            transition: border-color 0.2s;
         }
-        .panel h2 { font-size: 15px; margin-bottom: 14px; }
-        .panel h2.blue  { color: #4fc3f7; }
-        .panel h2.amber { color: #ffb74d; }
-        .panel h2.green { color: #81c784; }
-        .panel h2.pink  { color: #f06292; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
-        .card {
-            background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
-            overflow: hidden; transition: border-color 0.2s;
+        .panel:hover { border-color: var(--border-h); }
+        .panel::after {
+            content: ''; position: absolute;
+            top: 0; left: 0; right: 0; height: 1px;
         }
-        .card:hover { border-color: #4fc3f7; }
-        .card img { width: 100%; display: block; image-rendering: pixelated; }
-        .info { padding: 14px; }
-        .time { color: #888; font-size: 11px; margin-bottom: 10px; }
-        .dims {
-            display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
-            margin-bottom: 10px;
+        .panel.blue::after  { background: linear-gradient(90deg, var(--blue) 0%, transparent 70%); }
+        .panel.green::after { background: linear-gradient(90deg, var(--green) 0%, transparent 70%); }
+        .panel.amber::after { background: linear-gradient(90deg, var(--amber) 0%, transparent 70%); }
+        .panel.pink::after  { background: linear-gradient(90deg, var(--pink) 0%, transparent 70%); }
+        .ph { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+        .pico {
+            width: 30px; height: 30px; border-radius: 7px;
+            display: flex; align-items: center; justify-content: center; font-size: 14px;
         }
-        .dim-box {
-            background: #222; border-radius: 6px; padding: 10px;
-            text-align: center;
+        .panel.blue  .pico { background: var(--blue-g);  color: var(--blue); }
+        .panel.green .pico { background: var(--green-g); color: var(--green); }
+        .panel.amber .pico { background: var(--amber-g); color: var(--amber); }
+        .panel.pink  .pico { background: var(--pink-g);  color: var(--pink); }
+        .ptitle { font-size: 13px; font-weight: 700; }
+        .panel.blue  .ptitle { color: var(--blue); }
+        .panel.green .ptitle { color: var(--green); }
+        .panel.amber .ptitle { color: var(--amber); }
+        .panel.pink  .ptitle { color: var(--pink); }
+        .pdesc { font-size: 12px; color: var(--t2); line-height: 1.65; margin-bottom: 14px; }
+        .cval {
+            background: var(--surface2); border: 1px solid var(--border);
+            border-radius: var(--rs); padding: 9px 12px;
+            font-size: 12px; color: var(--t2); margin-bottom: 12px;
         }
-        .dim-label { color: #888; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
-        .dim-value { font-size: 20px; font-weight: bold; margin-top: 2px; }
-        .dim-value.w { color: #4fc3f7; }
-        .dim-value.h { color: #81c784; }
-        .dim-value.wt { color: #ffb74d; }
-        .dim-value.a { color: #ce93d8; }
-        .dim-value.d { color: #e57373; }
-        .dim-value.ht { color: #f06292; }
-        .dim-sub { color: #666; font-size: 11px; }
-        .no-detect { color: #ef5350; font-style: italic; padding: 10px; text-align: center; }
-        .empty { color: #555; text-align: center; padding: 60px; font-size: 16px; }
-        .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
-        .row label { color: #aaa; font-size: 13px; min-width: 120px; }
-        input[type=number], input[type=text] {
-            background: #222; border: 1px solid #444; border-radius: 6px;
-            color: #fff; padding: 8px 12px; font-size: 14px; width: 130px;
+        .cval b { color: var(--green); }
+        hr { border: none; border-top: 1px solid var(--border); margin: 13px 0; }
+        .row { display: flex; gap: 8px; align-items: center; margin-bottom: 9px; flex-wrap: wrap; }
+        .row label { font-size: 12px; color: var(--t2); font-weight: 500; min-width: 108px; }
+        input[type=number], input[type=text], input[type=date] {
+            background: var(--surface2); border: 1px solid var(--border);
+            border-radius: var(--rs); color: var(--t1);
+            padding: 7px 10px; font-size: 12px; font-family: 'Inter', sans-serif;
+            width: 105px; transition: border-color 0.2s;
         }
-        input[type=number]:focus { outline: none; border-color: #4fc3f7; }
-        .hint { color: #666; font-size: 12px; margin-top: 6px; }
-        .result { font-size: 13px; margin-top: 8px; display: none; }
-        .current-val { color: #81c784; font-size: 13px; margin-bottom: 10px; }
+        input:focus { outline: none; border-color: var(--blue); }
+        input[type=date] { width: auto; color-scheme: dark; }
+        .hint { color: var(--t3); font-size: 11px; margin-top: 5px; }
+        .result {
+            font-size: 12px; margin-top: 8px; display: none;
+            padding: 7px 10px; border-radius: var(--rs); background: var(--surface2);
+        }
+        .check-row { display: flex; align-items: center; gap: 7px; margin-bottom: 11px; cursor: pointer; }
+        .check-row input[type=checkbox] { accent-color: var(--blue); width: 14px; height: 14px; }
+        .check-row span { font-size: 12px; color: var(--t2); }
+        .board-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-bottom: 11px; }
+        .board-cell {
+            background: var(--surface2); border: 1px solid var(--border);
+            border-radius: var(--rs); padding: 9px; text-align: center;
+        }
+        .board-cell .dim-label { color: var(--t3); font-size: 9px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 5px; }
+        .board-cell .inputs { display: flex; gap: 5px; justify-content: center; }
+        .board-cell input { width: 52px !important; padding: 4px 3px !important; text-align: center; font-size: 11px !important; }
 
-        /* Buttons */
+        /* ── Buttons ── */
         .btn {
-            border: none; border-radius: 6px;
-            padding: 9px 22px; font-size: 14px; font-weight: bold; cursor: pointer;
+            border: none; border-radius: var(--rs); padding: 8px 16px;
+            font-size: 12px; font-weight: 600; cursor: pointer;
+            font-family: 'Inter', sans-serif; transition: all 0.15s;
+            display: inline-flex; align-items: center; gap: 5px;
         }
-        .btn:disabled { background: #555 !important; color: #888 !important; cursor: not-allowed; }
-        .btn-blue  { background: #4fc3f7; color: #000; }
-        .btn-blue:hover  { background: #29b6f6; }
-        .btn-amber { background: #ffb74d; color: #000; }
-        .btn-amber:hover { background: #ffa726; }
-        .btn-green { background: #81c784; color: #000; }
-        .btn-green:hover { background: #66bb6a; }
-        .btn-pink  { background: #f06292; color: #000; }
-        .btn-pink:hover  { background: #ec407a; }
-        .btn-red   { background: #c0392b; color: #fff; }
-        .btn-red:hover   { background: #e74c3c; }
+        .btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none !important; }
+        .btn-blue  { background: var(--blue);  color: #000; }
+        .btn-blue:not(:disabled):hover  { background: #7dd3fc; transform: translateY(-1px); box-shadow: 0 6px 20px var(--blue-g); }
+        .btn-green { background: var(--green); color: #000; }
+        .btn-green:not(:disabled):hover { background: #86efac; transform: translateY(-1px); box-shadow: 0 6px 20px var(--green-g); }
+        .btn-amber { background: var(--amber); color: #000; }
+        .btn-amber:not(:disabled):hover { background: #fcd34d; transform: translateY(-1px); box-shadow: 0 6px 20px var(--amber-g); }
+        .btn-pink  { background: var(--pink);  color: #000; }
+        .btn-pink:not(:disabled):hover  { background: #f9a8d4; transform: translateY(-1px); box-shadow: 0 6px 20px var(--pink-g); }
+        .btn-red   { background: transparent; color: var(--red); border: 1px solid rgba(248,113,113,0.25); }
+        .btn-red:not(:disabled):hover   { background: rgba(248,113,113,0.08); border-color: var(--red); }
 
-        .raw-info { color: #666; font-size: 11px; margin-top: 4px; }
-        .board-grid {
-            display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px;
+        /* ── Delete bar ── */
+        .del-bar {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r); padding: 12px 18px;
+            display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+            margin-bottom: 22px;
         }
-        .board-cell { background: #222; border-radius: 6px; padding: 8px; text-align: center; }
-        .board-cell .dim-label { color: #888; font-size: 10px; letter-spacing: 1px; margin-bottom: 4px; }
-        .board-cell .inputs { display: flex; gap: 6px; justify-content: center; }
-        .board-cell input { width: 58px !important; padding: 4px !important; text-align: center; }
+        .del-bar-lbl { font-size: 12px; font-weight: 500; color: var(--t2); white-space: nowrap; }
+
+        /* ── Grid ── */
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 14px; }
+        .card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--r); overflow: hidden;
+            transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+        }
+        .card:hover { border-color: var(--border-h); transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+        .card img { width: 100%; display: block; image-rendering: pixelated; border-bottom: 1px solid var(--border); }
+        .card-body { padding: 14px; }
+        .card-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .card-time { color: var(--t3); font-size: 11px; }
+        .badge {
+            font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+            padding: 3px 9px; border-radius: 20px; text-transform: uppercase;
+        }
+        .badge.ok  { background: rgba(74,222,128,0.1);  color: var(--green); border: 1px solid rgba(74,222,128,0.2); }
+        .badge.err { background: rgba(248,113,113,0.1); color: var(--red);   border: 1px solid rgba(248,113,113,0.2); }
+        .no-detect {
+            text-align: center; padding: 10px; color: var(--red);
+            font-size: 12px; font-weight: 500;
+            background: rgba(248,113,113,0.05); border-radius: var(--rs); margin-bottom: 10px;
+        }
+        .dims { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-bottom: 10px; }
+        .dim-box {
+            background: var(--surface2); border: 1px solid var(--border);
+            border-radius: var(--rs); padding: 9px 6px; text-align: center;
+        }
+        .dim-label { color: var(--t3); font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 3px; }
+        .dim-value { font-size: 16px; font-weight: 700; line-height: 1.2; }
+        .dim-value.w  { color: var(--blue); }
+        .dim-value.h  { color: var(--green); }
+        .dim-value.wt { color: var(--amber); }
+        .dim-value.a  { color: var(--purple); }
+        .dim-value.d  { color: var(--orange); }
+        .dim-value.ht { color: var(--pink); }
+        .dim-sub { color: var(--t3); font-size: 10px; margin-top: 2px; }
+        .raw { font-size: 10px; color: var(--t3); font-family: 'Courier New', monospace;
+               background: var(--surface2); padding: 5px 8px; border-radius: 5px; margin-bottom: 4px; }
+        .card-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+        .empty { text-align: center; padding: 80px 20px; color: var(--t3); }
+        .empty-icon { font-size: 40px; opacity: 0.25; display: block; margin-bottom: 14px; }
+
+        @media (max-width: 700px) {
+            .hdr { padding: 0 14px; }
+            .wrap { padding: 14px; }
+            .panels, .grid { grid-template-columns: 1fr; }
+            .hdr-sub, .chip { display: none; }
+        }
     </style>
 </head>
 <body>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-        <h1>ESP32 4D Scale</h1>
-        <a href="/logout" style="color:#888;font-size:12px;text-decoration:none;border:1px solid #333;border-radius:6px;padding:4px 12px;">Logout</a>
+<header class="hdr">
+    <div class="hdr-l">
+        <div class="logo">4D</div>
+        <div>
+            <div class="hdr-title">4D Scale Dashboard</div>
+            <div class="hdr-sub">ESP32 Measurement System</div>
+        </div>
     </div>
-    <p class="subtitle">{{ measurements|length }} measurement{{ 's' if measurements|length != 1 }} captured</p>
+    <div class="hdr-r">
+        <div class="chip"><b>{{ measurements|length }}</b> measurement{{ 's' if measurements|length != 1 }}</div>
+        <a href="/logout" class="logout">Sign out</a>
+    </div>
+</header>
 
+<div class="wrap">
+    <p class="sec-label">Controls</p>
     <div class="panels">
 
         <!-- MEASURE -->
-        <div class="panel">
-            <h2 class="blue">Trigger Measurement</h2>
-            <p class="hint" style="margin-bottom:14px;">Triggers both ESP32s simultaneously — camera captures dimensions, HX711 measures weight.</p>
-            <button class="btn btn-blue" id="btnMeasure" onclick="doTrigger('both')">&#9654; Measure</button>
+        <div class="panel blue">
+            <div class="ph"><div class="pico">&#9654;</div><div class="ptitle">Trigger Measurement</div></div>
+            <p class="pdesc">Fires both ESP32s — camera captures L×W×H, HX711 measures weight.</p>
+            <button class="btn btn-blue" id="btnMeasure" onclick="doTrigger('both')">&#9654;&nbsp; Measure Now</button>
             <div class="result" id="resultMeasure"></div>
         </div>
 
         <!-- BASELINE -->
-        <div class="panel">
-            <h2 class="green">Baseline Distance (Camera ESP32)</h2>
-            <div class="current-val">Current: <strong id="currentBaseline">{{ config.get('baseline_cm', 0) }}</strong> cm
-                {% if config.get('baseline_cm', 0) == 0 %}<span style="color:#888"> (auto at boot)</span>{% endif %}
-            </div>
-            <p class="hint" style="margin-bottom:10px;">Re-measure: place empty board and trigger camera ESP32 to read the ultrasonic baseline.</p>
-            <button class="btn btn-green" id="btnBaseline" onclick="doTrigger('camera', {remeasure_baseline: true})" style="margin-bottom:12px;">
-                &#8635; Re-measure Baseline
-            </button>
+        <div class="panel green">
+            <div class="ph"><div class="pico">&#8645;</div><div class="ptitle">Baseline Distance</div></div>
+            <div class="cval">Current: <b id="currentBaseline">{{ config.get('baseline_cm', 0) }} cm</b>{% if config.get('baseline_cm', 0) == 0 %} <span style="color:var(--t3)">(auto at boot)</span>{% endif %}</div>
+            <p class="pdesc">Place empty board and re-measure, or enter manually below.</p>
+            <button class="btn btn-green" id="btnBaseline" onclick="doTrigger('camera', {remeasure_baseline: true})" style="margin-bottom:10px;">&#8635;&nbsp; Re-measure</button>
             <div class="result" id="resultBaseline"></div>
-            <hr style="border-color:#333;margin:12px 0;">
-            <p class="hint" style="margin-bottom:8px;">Or enter manually:</p>
+            <hr>
             <div class="row">
-                <label>Distance (cm):</label>
-                <input type="number" id="baselineInput" step="0.1" min="1" placeholder="e.g. 153.5">
+                <label>Distance (cm)</label>
+                <input type="number" id="baselineInput" step="0.1" min="1" placeholder="e.g. 149.0">
                 <button class="btn btn-green" onclick="doSetBaseline()">Save</button>
             </div>
             <div class="result" id="resultBaselineSave"></div>
         </div>
 
-        <!-- WEIGHT CALIBRATION -->
-        <div class="panel">
-            <h2 class="amber">Weight Calibration (HX711 ESP32)</h2>
-            <p class="hint" style="margin-bottom:10px;">
-                <strong>Step 1:</strong> Keep board empty, check "Tare first", click Weigh — ESP32 tares &amp; stores zero reference.<br>
-                <strong>Step 2:</strong> Place known weight, uncheck "Tare first", click Weigh — ESP32 weighs using stored tare.<br>
-                <strong>Step 3:</strong> Enter the actual weight below and click Calibrate.
+        <!-- WEIGHT CAL -->
+        <div class="panel amber">
+            <div class="ph"><div class="pico">&#9878;</div><div class="ptitle">Weight Calibration</div></div>
+            <p class="pdesc">
+                <b style="color:var(--t1)">1.</b> Empty board + Tare → Weigh<br>
+                <b style="color:var(--t1)">2.</b> Known weight, no tare → Weigh<br>
+                <b style="color:var(--t1)">3.</b> Enter weight → Calibrate
             </p>
-            <div class="row" style="margin-bottom:10px;">
-                <label style="cursor:pointer;color:#aaa;font-size:13px;">
-                    <input type="checkbox" id="tareFirst"> Tare first (keep board empty)
-                </label>
-            </div>
-            <button class="btn btn-amber" id="btnWeightTrigger" onclick="doWeightTrigger()" style="margin-bottom:12px;">
-                &#9654; Weigh
-            </button>
+            <label class="check-row">
+                <input type="checkbox" id="tareFirst"><span>Tare first (board empty)</span>
+            </label>
+            <button class="btn btn-amber" id="btnWeightTrigger" onclick="doWeightTrigger()" style="margin-bottom:10px;">&#9654;&nbsp; Weigh</button>
             <div class="result" id="resultWeightTrigger"></div>
-            <hr style="border-color:#333;margin:12px 0;">
+            <hr>
             <div class="row">
-                <label>Known weight (g):</label>
-                <input type="number" id="knownWeight" placeholder="e.g. 500" step="0.1" style="width:100px;">
+                <label>Known weight (g)</label>
+                <input type="number" id="knownWeight" placeholder="e.g. 500" step="0.1" style="width:95px;">
                 <button class="btn btn-amber" onclick="doWeightCalibrate()">Calibrate</button>
             </div>
-            <div class="current-val" style="margin-top:10px;">
-                cal_factor: <strong id="calFactorDisplay">{{ config.get('cal_factor', 27.93) }}</strong>
-            </div>
+            <div class="cval" style="margin-top:10px;margin-bottom:0;">cal_factor: <b id="calFactorDisplay">{{ config.get('cal_factor', 27.93) }}</b></div>
             <div class="result" id="resultWeightCal"></div>
         </div>
 
-        <!-- BOARD CALIBRATION -->
-        <div class="panel">
-            <h2 class="pink">Board Calibration (Camera ESP32)</h2>
-            <p class="hint" style="margin-bottom:10px;">Capture raw image to identify board corners, then save the coordinates.</p>
-            <div class="row" style="margin-bottom:12px;">
-                <label style="cursor:pointer;color:#aaa;">
-                    <input type="checkbox" id="rawCaptureCheck" {% if config.get('raw_capture') %}checked{% endif %} onchange="doSetRawCapture(this.checked)"> Raw capture mode
+        <!-- BOARD CAL -->
+        <div class="panel pink">
+            <div class="ph"><div class="pico">&#9974;</div><div class="ptitle">Board Calibration</div></div>
+            <p class="pdesc">Capture raw image, set board corners, tune image params.</p>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:11px;">
+                <label class="check-row" style="margin-bottom:0;">
+                    <input type="checkbox" id="rawCaptureCheck" {% if config.get('raw_capture') %}checked{% endif %} onchange="doSetRawCapture(this.checked)">
+                    <span>Raw capture mode</span>
                 </label>
-                <button class="btn btn-pink" id="btnCapture" onclick="doCaptureRaw()">Capture Raw</button>
+                <button class="btn btn-pink" id="btnCapture" onclick="doCaptureRaw()">&#128247; Capture</button>
             </div>
             <div class="result" id="resultCapture"></div>
             <div class="board-grid">
                 <div class="board-cell">
-                    <div class="dim-label">P0 — Top-Left</div>
+                    <div class="dim-label">P0 Top-Left</div>
                     <div class="inputs">
                         <input type="number" id="bp0x" value="{{ config.get('board_p0x', 50) }}">
                         <input type="number" id="bp0y" value="{{ config.get('board_p0y', 18) }}">
                     </div>
                 </div>
                 <div class="board-cell">
-                    <div class="dim-label">P1 — Top-Right</div>
+                    <div class="dim-label">P1 Top-Right</div>
                     <div class="inputs">
                         <input type="number" id="bp1x" value="{{ config.get('board_p1x', 195) }}">
                         <input type="number" id="bp1y" value="{{ config.get('board_p1y', 18) }}">
                     </div>
                 </div>
                 <div class="board-cell">
-                    <div class="dim-label">P3 — Bottom-Left</div>
+                    <div class="dim-label">P3 Bot-Left</div>
                     <div class="inputs">
                         <input type="number" id="bp3x" value="{{ config.get('board_p3x', 50) }}">
                         <input type="number" id="bp3y" value="{{ config.get('board_p3y', 160) }}">
                     </div>
                 </div>
                 <div class="board-cell">
-                    <div class="dim-label">P2 — Bottom-Right</div>
+                    <div class="dim-label">P2 Bot-Right</div>
                     <div class="inputs">
                         <input type="number" id="bp2x" value="{{ config.get('board_p2x', 195) }}">
                         <input type="number" id="bp2y" value="{{ config.get('board_p2y', 160) }}">
                     </div>
                 </div>
             </div>
-            <div class="row">
-                <label>Pixels/mm:</label>
-                <input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:90px;">
-                <button class="btn btn-pink" onclick="doSaveCrop()">Save Corners</button>
-            </div>
-            <div class="row">
-                <label>Sobel Threshold:</label>
-                <input type="number" id="bsobel" value="{{ config.get('sobel_threshold', 60) }}" min="0" max="2040" step="10" style="width:90px;">
-            </div>
-            <div class="row">
-                <label>Dilation Iters:</label>
-                <input type="number" id="bdilation" value="{{ config.get('dilation_iterations', 1) }}" min="1" max="5" step="1" style="width:90px;">
-            </div>
-            <div class="row">
-                <label>Min BBox Area %:</label>
-                <input type="number" id="bminbbox" value="{{ config.get('min_bbox_area_pct', 2) }}" min="1" max="10" step="1" style="width:90px;">
-            </div>
-            <div class="hint" style="margin-top:6px;">Image is 320×240. x, y per corner.</div>
+            <div class="row"><label>Pixels/mm</label><input type="number" id="bppmm" value="{{ config.get('pixels_per_mm', 0.1644) }}" step="0.0001" style="width:85px;"><button class="btn btn-pink" onclick="doSaveCrop()">&#10003; Save All</button></div>
+            <div class="row"><label>Sobel Threshold</label><input type="number" id="bsobel" value="{{ config.get('sobel_threshold', 60) }}" min="0" max="2040" step="10" style="width:80px;"></div>
+            <div class="row"><label>Dilation Iters</label><input type="number" id="bdilation" value="{{ config.get('dilation_iterations', 1) }}" min="1" max="5" style="width:80px;"></div>
+            <div class="row"><label>Min BBox Area %</label><input type="number" id="bminbbox" value="{{ config.get('min_bbox_area_pct', 2) }}" min="1" max="10" style="width:80px;"></div>
+            <div class="hint">Image 320×240 px &middot; x, y per corner</div>
             <div class="result" id="resultCrop"></div>
         </div>
 
-    </div><!-- end panels -->
-
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
-        <label style="color:#aaa;font-size:13px;">Delete by date range:</label>
-        <input type="date" id="fromDate" style="background:#222;border:1px solid #444;border-radius:6px;color:#fff;padding:6px 10px;font-size:13px;">
-        <span style="color:#888;">to</span>
-        <input type="date" id="toDate" style="background:#222;border:1px solid #444;border-radius:6px;color:#fff;padding:6px 10px;font-size:13px;">
-        <button class="btn btn-red" onclick="doDeleteRange()">Delete Range</button>
-        <span id="resultDeleteRange" style="font-size:13px;display:none;"></span>
     </div>
 
+    <!-- DELETE BAR -->
+    <div class="del-bar">
+        <span class="del-bar-lbl">&#128465; Delete by date:</span>
+        <input type="date" id="fromDate">
+        <span style="color:var(--t3);font-size:12px;">→</span>
+        <input type="date" id="toDate">
+        <button class="btn btn-red" onclick="doDeleteRange()">Delete Range</button>
+        <span id="resultDeleteRange" style="font-size:12px;display:none;"></span>
+    </div>
+
+    <!-- MEASUREMENTS -->
+    <p class="sec-label">Measurements</p>
     {% if not measurements %}
-    <div class="empty">Waiting for ESP32 to upload results...</div>
+    <div class="empty">
+        <span class="empty-icon">&#128202;</span>
+        Waiting for ESP32 to upload results...
+    </div>
     {% endif %}
 
     <div class="grid">
     {% for m in measurements %}
         <div class="card">
             {% if m.image %}<img src="/files/{{ m.image }}" alt="result">{% endif %}
-            <div class="info">
-                <div class="time">{{ m.timestamp }}</div>
-                {% if m.valid %}
+            <div class="card-body">
+                <div class="card-hdr">
+                    <span class="card-time">{{ m.timestamp }}</span>
+                    {% if m.valid %}<span class="badge ok">&#10003; Detected</span>
+                    {% else %}<span class="badge err">&#10007; No Object</span>{% endif %}
+                </div>
+                {% if not m.valid %}<div class="no-detect">No object detected</div>{% endif %}
                 <div class="dims">
+                    {% if m.valid %}
                     <div class="dim-box">
                         <div class="dim-label">Length</div>
-                        <div class="dim-value w">{{ "%.2f"|format(m.get('length_mm', 0) / 10) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.get('length_mm', 0)) }} mm</div>
+                        <div class="dim-value w">{{ "%.1f"|format(m.get('length_mm', 0) / 10) }}</div>
+                        <div class="dim-sub">cm &middot; {{ "%.0f"|format(m.get('length_mm', 0)) }}mm</div>
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Width</div>
-                        <div class="dim-value h">{{ "%.2f"|format(m.get('width_mm', 0) / 10) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.get('width_mm', 0)) }} mm</div>
+                        <div class="dim-value h">{{ "%.1f"|format(m.get('width_mm', 0) / 10) }}</div>
+                        <div class="dim-sub">cm &middot; {{ "%.0f"|format(m.get('width_mm', 0)) }}mm</div>
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Height</div>
                         {% if m.get('height_cm', 0) > 0 %}
-                        <div class="dim-value ht">{{ "%.2f"|format(m.get('height_cm', 0)) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.get('height_cm', 0) * 10) }} mm</div>
-                        {% else %}
-                        <div class="dim-value ht">N/A</div>
-                        {% endif %}
+                        <div class="dim-value ht">{{ "%.1f"|format(m.get('height_cm', 0)) }}</div>
+                        <div class="dim-sub">cm &middot; {{ "%.0f"|format(m.get('height_cm', 0)*10) }}mm</div>
+                        {% else %}<div class="dim-value ht" style="font-size:13px;">N/A</div>{% endif %}
                     </div>
+                    {% endif %}
                     <div class="dim-box">
                         <div class="dim-label">Weight</div>
-                        <div class="dim-value wt">{{ "%.1f"|format(m.weight_g) }} g</div>
-                        <div class="dim-sub">{{ "%.3f"|format(m.weight_g / 1000) }} kg</div>
+                        <div class="dim-value wt">{{ "%.0f"|format(m.weight_g) }}</div>
+                        <div class="dim-sub">g &middot; {{ "%.3f"|format(m.weight_g/1000) }}kg</div>
                     </div>
+                    {% if m.valid %}
                     <div class="dim-box">
                         <div class="dim-label">Angle</div>
                         <div class="dim-value a">{{ "%.1f"|format(m.angle) }}&deg;</div>
                         <div class="dim-sub">rotation</div>
                     </div>
                     <div class="dim-box">
-                        <div class="dim-label">Ultrasonic</div>
+                        <div class="dim-label">Obj Dist</div>
                         {% if m.get('object_cm', -1) > 0 %}
-                        <div class="dim-value d">{{ "%.2f"|format(m.get('object_cm', 0)) }} cm</div>
-                        <div class="dim-sub">baseline: {{ "%.2f"|format(m.get('baseline_cm', 0)) }} cm</div>
-                        {% else %}
-                        <div class="dim-value d">N/A</div>
-                        {% endif %}
+                        <div class="dim-value d">{{ "%.1f"|format(m.get('object_cm', 0)) }}</div>
+                        <div class="dim-sub">cm</div>
+                        {% else %}<div class="dim-value d" style="font-size:13px;">N/A</div>{% endif %}
                     </div>
-                </div>
-                <div class="raw-info">raw_tare: {{ m.raw_tare }} | raw_avg: {{ m.raw_avg }} | diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} | ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
-                {% if m.get('tare_readings') %}<div class="raw-info">tare: {{ m.tare_readings }}</div>{% endif %}
-                {% if m.get('weight_readings') %}<div class="raw-info">weight: {{ m.weight_readings }}</div>{% endif %}
-                {% else %}
-                <div class="no-detect">No object detected</div>
-                <div class="dims">
-                    <div class="dim-box">
-                        <div class="dim-label">Weight</div>
-                        <div class="dim-value wt">{{ "%.1f"|format(m.weight_g) }} g</div>
-                        <div class="dim-sub">{{ "%.3f"|format(m.weight_g / 1000) }} kg</div>
-                    </div>
+                    {% else %}
                     <div class="dim-box">
                         <div class="dim-label">Height</div>
                         {% if m.get('height_cm', 0) > 0 %}
-                        <div class="dim-value ht">{{ "%.2f"|format(m.get('height_cm', 0)) }} cm</div>
-                        <div class="dim-sub">{{ "%.1f"|format(m.get('height_cm', 0) * 10) }} mm</div>
-                        {% else %}
-                        <div class="dim-value ht">N/A</div>
-                        {% endif %}
+                        <div class="dim-value ht">{{ "%.1f"|format(m.get('height_cm', 0)) }}</div>
+                        <div class="dim-sub">cm</div>
+                        {% else %}<div class="dim-value ht" style="font-size:13px;">N/A</div>{% endif %}
                     </div>
                     <div class="dim-box">
                         <div class="dim-label">Ultrasonic</div>
                         {% if m.get('object_cm', -1) > 0 %}
-                        <div class="dim-value d">{{ "%.2f"|format(m.get('object_cm', 0)) }} cm</div>
-                        <div class="dim-sub">baseline: {{ "%.2f"|format(m.get('baseline_cm', 0)) }} cm</div>
-                        {% else %}
-                        <div class="dim-value d">N/A</div>
-                        {% endif %}
+                        <div class="dim-value d">{{ "%.1f"|format(m.get('object_cm', 0)) }}</div>
+                        <div class="dim-sub">cm</div>
+                        {% else %}<div class="dim-value d" style="font-size:13px;">N/A</div>{% endif %}
                     </div>
+                    {% endif %}
                 </div>
-                {% if m.get('tare_readings') %}<div class="raw-info">tare: {{ m.tare_readings }}</div>{% endif %}
-                {% if m.get('weight_readings') %}<div class="raw-info">weight: {{ m.weight_readings }}</div>{% endif %}
-                {% endif %}
-                <div style="text-align:right;margin-top:6px;">
-                    <button onclick="doDelete('{{ m.image }}')" class="btn btn-red" style="padding:4px 12px;font-size:12px;">Delete</button>
+                <div class="raw">tare: {{ m.raw_tare }} &nbsp;|&nbsp; avg: {{ m.raw_avg }} &nbsp;|&nbsp; diff: {{ (m.raw_avg - m.raw_tare)|abs }}{% if m.get('pixels_per_mm', 0) > 0 %} &nbsp;|&nbsp; ppmm: {{ "%.4f"|format(m.pixels_per_mm) }}{% endif %}</div>
+                {% if m.get('tare_readings') %}<div class="raw">tare: {{ m.tare_readings }}</div>{% endif %}
+                {% if m.get('weight_readings') %}<div class="raw">weight: {{ m.weight_readings }}</div>{% endif %}
+                <div class="card-foot">
+                    <button onclick="doDelete('{{ m.image }}')" class="btn btn-red" style="padding:4px 10px;font-size:11px;">&#128465; Delete</button>
                 </div>
             </div>
         </div>
     {% endfor %}
     </div>
+</div>
 
     <script>
     const API_BASE = '';
