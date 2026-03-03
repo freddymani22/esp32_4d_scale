@@ -248,6 +248,33 @@ def set_board_crop():
     return {"status": "ok", "config": {k: cfg[k] for k in pt_keys if k in cfg}}
 
 
+# Delete measurements within a date range (inclusive)
+@app.route("/api/delete_range", methods=["POST"])
+def delete_range():
+    body = request.get_json()
+    if not body or "from_date" not in body or "to_date" not in body:
+        return {"status": "error", "message": "missing from_date or to_date"}, 400
+    from_date = body["from_date"]  # "YYYY-MM-DD"
+    to_date   = body["to_date"]    # "YYYY-MM-DD"
+    measurements = load_measurements()
+    keep, remove = [], []
+    for m in measurements:
+        date = m.get("timestamp", "")[:10]  # "YYYY-MM-DD"
+        if from_date <= date <= to_date:
+            remove.append(m)
+        else:
+            keep.append(m)
+    for m in remove:
+        filename = m.get("image", "")
+        if filename:
+            img_path = os.path.join(UPLOAD_DIR, filename)
+            if os.path.exists(img_path) and os.path.isfile(img_path):
+                os.remove(img_path)
+    save_measurements(keep)
+    print(f"delete_range {from_date}→{to_date}: deleted {len(remove)}, kept {len(keep)}")
+    return {"status": "ok", "deleted": len(remove), "kept": len(keep)}
+
+
 # Delete a measurement and its image
 @app.route("/api/delete", methods=["POST"])
 def delete_measurement():
@@ -590,6 +617,15 @@ PAGE_TEMPLATE = """
 
     </div><!-- end panels -->
 
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
+        <label style="color:#aaa;font-size:13px;">Delete by date range:</label>
+        <input type="date" id="fromDate" style="background:#222;border:1px solid #444;border-radius:6px;color:#fff;padding:6px 10px;font-size:13px;">
+        <span style="color:#888;">to</span>
+        <input type="date" id="toDate" style="background:#222;border:1px solid #444;border-radius:6px;color:#fff;padding:6px 10px;font-size:13px;">
+        <button class="btn btn-red" onclick="doDeleteRange()">Delete Range</button>
+        <span id="resultDeleteRange" style="font-size:13px;display:none;"></span>
+    </div>
+
     {% if not measurements %}
     <div class="empty">Waiting for ESP32 to upload results...</div>
     {% endif %}
@@ -791,6 +827,32 @@ PAGE_TEMPLATE = """
             result.textContent = 'Request failed: ' + e.message;
         }
         btn.disabled = false; btn.textContent = '\U0001F4F7 Capture Raw';
+    }
+
+    async function doDeleteRange() {
+        const from = document.getElementById('fromDate').value;
+        const to   = document.getElementById('toDate').value;
+        const result = document.getElementById('resultDeleteRange');
+        if (!from || !to) {
+            result.style.display = 'inline'; result.style.color = '#ef5350';
+            result.textContent = 'Select both dates.'; return;
+        }
+        if (!confirm(`Delete all measurements from ${from} to ${to}?`)) return;
+        const resp = await fetch(API_BASE + '/api/delete_range', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({from_date: from, to_date: to})
+        });
+        const data = await resp.json();
+        result.style.display = 'inline';
+        if (data.status === 'ok') {
+            result.style.color = '#81c784';
+            result.textContent = `Deleted ${data.deleted}, kept ${data.kept}.`;
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            result.style.color = '#ef5350';
+            result.textContent = 'Error: ' + data.message;
+        }
     }
 
     async function doDelete(filename) {
