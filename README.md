@@ -100,22 +100,64 @@ The camera-to-empty-board distance used as the height reference. Either:
 
 ### Board corners (crop region)
 
-1. Enable **Raw capture mode** in Board Calibration
-2. Click **Capture** — uploads a raw unprocessed image
-3. Inspect the image to find the board pixel boundaries
-4. Enter the four corner coordinates (P0–P3)
-5. Disable raw capture mode, click **Save All**
+The system needs to know exactly where the measurement board is in the camera's field of view. This is done once using `find_coords.py` — a GUI tool that lets you click the corners directly on the image.
 
-Use `server/find_coords.py` to interactively click corners on a saved image and read pixel coordinates.
+**Step 1 — Capture a raw image**
+
+1. Open the dashboard → Calibration Settings → Board Calibration
+2. Enable **Raw capture mode**
+3. Click **Capture** — this uploads a raw unprocessed image to `server/uploads/`
+
+**Step 2 — Find the corner coordinates**
+
+Run on the machine that has the `server/uploads/` folder:
+
+```bash
+cd server
+./venv/bin/python3 find_coords.py
+```
+
+This opens a 3× zoomed view of the latest uploaded image. Click the four corners of the plywood board **in order: Top-Left → Top-Right → Bottom-Right → Bottom-Left**. Each click shows the pixel coordinates and draws the outline. When all four are clicked, the terminal prints:
+
+```
+  P0 (TL): x=50, y=18
+  P1 (TR): x=195, y=18
+  P2 (BR): x=195, y=160
+  P3 (BL): x=50, y=160
+```
+
+**Step 3 — Enter values in the dashboard**
+
+Enter the printed P0–P3 values into the Board Calibration fields, disable **Raw capture mode**, and click **Save All**.
 
 ### Pixels per mm
 
-Sets the scale factor used to convert pixel distances to real-world mm. To calibrate:
-1. Place a known-size object and take a measurement
-2. Compare reported dimensions to actual: `new_ppmm = current_ppmm × (reported_mm / actual_mm)`
-3. Enter the corrected value in the **Pixels/mm** field and click **Save All**
+Sets the scale factor that converts pixel distances to real-world millimetres. Two ways to calibrate:
 
-The scale adjusts dynamically per measurement based on the object's ultrasonic distance from the camera.
+**Option A — Using `find_coords.py` (most accurate)**
+
+```bash
+cd server
+./venv/bin/python3 find_coords.py --ppmm
+```
+
+This opens the image cropped to your board region. Click the **top-left** then **bottom-right** corner of a known-size object on the board. Enter the actual dimensions when prompted and the script calculates and prints the correct `ppmm`:
+
+```
+  ppmm from width:  0.2181
+  ppmm from height: 0.2194
+  Average ppmm:     0.2188  ← use this
+```
+
+Enter this value in the **Pixels/mm** field and click **Save All**.
+
+**Option B — From a measurement**
+
+1. Place a known-size object, take a measurement
+2. Calculate: `new_ppmm = current_ppmm × (actual_mm / reported_mm)`
+3. Enter corrected value → **Save All**
+
+The ppmm scales automatically per measurement using the ultrasonic sensor distance, so calibrate at your typical object height.
 
 ### Weight (cal_factor)
 
