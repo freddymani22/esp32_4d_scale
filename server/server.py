@@ -1,4 +1,4 @@
-from flask import Flask, request, send_from_directory, render_template_string, session, redirect, url_for
+from flask import Flask, request, send_from_directory, render_template_string, session, redirect, url_for, jsonify
 from functools import wraps
 import os
 import json
@@ -326,6 +326,12 @@ def delete_measurement():
         if os.path.exists(img_path) and os.path.isfile(img_path):
             os.remove(img_path)
     return {"status": "ok"}
+
+
+@app.route("/api/measurements")
+@login_required
+def api_measurements():
+    return jsonify(load_measurements())
 
 
 # Save trigger mode
@@ -796,6 +802,25 @@ PAGE_TEMPLATE = """
         .empty { text-align: center; padding: 80px 20px; color: var(--t3); }
         .empty-icon { font-size: 40px; opacity: 0.25; display: block; margin-bottom: 14px; }
 
+        /* ── Loading overlay ── */
+        .overlay {
+            position: fixed; inset: 0; z-index: 999;
+            background: rgba(7,7,15,0.88); backdrop-filter: blur(4px);
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 20px;
+            opacity: 0; pointer-events: none; transition: opacity 0.25s;
+        }
+        .overlay.show { opacity: 1; pointer-events: all; }
+        .spinner {
+            width: 48px; height: 48px; border-radius: 50%;
+            border: 3px solid var(--surface3);
+            border-top-color: var(--blue);
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .overlay-title { font-size: 16px; font-weight: 600; color: var(--t1); }
+        .overlay-sub   { font-size: 12px; color: var(--t3); }
+
         @media (max-width: 900px) {
             .accord-body { grid-template-columns: 1fr; }
             .panel { border-right: none; border-bottom: 1px solid var(--border); }
@@ -833,7 +858,7 @@ PAGE_TEMPLATE = """
         </div>
     </div>
     <div class="hdr-r">
-        <div class="chip"><b>{{ measurements|length }}</b> measurement{{ 's' if measurements|length != 1 }}</div>
+        <div class="chip" id="countChip"><b>{{ measurements|length }}</b> measurement{{ 's' if measurements|length != 1 }}</div>
         <a href="/logout" class="logout">Sign out</a>
     </div>
 </header>
@@ -973,7 +998,7 @@ PAGE_TEMPLATE = """
     </div>
     {% endif %}
 
-    <div class="grid">
+    <div class="grid" id="measureGrid">
     {% for m in measurements %}
         <div class="card">
             {% if m.image %}<img src="/files/{{ m.image }}" alt="result">{% endif %}
@@ -1068,8 +1093,124 @@ PAGE_TEMPLATE = """
     </div>
 </div>
 
+<!-- Loading overlay -->
+<div class="overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <div class="overlay-title" id="overlayTitle">Measuring...</div>
+    <div class="overlay-sub" id="overlaySub">Please wait while the device captures data</div>
+</div>
+
     <script>
     const API_BASE = '';
+
+    /* ── Overlay helpers ── */
+    function showOverlay(title, sub) {
+        document.getElementById('overlayTitle').textContent = title;
+        document.getElementById('overlaySub').textContent = sub || '';
+        document.getElementById('loadingOverlay').classList.add('show');
+    }
+    function hideOverlay() {
+        document.getElementById('loadingOverlay').classList.remove('show');
+    }
+
+    /* ── Render a single measurement card from JSON ── */
+    function fmt1(v) { return parseFloat(v || 0).toFixed(1); }
+    function fmt0(v) { return parseFloat(v || 0).toFixed(0); }
+    function fmt3(v) { return parseFloat(v || 0).toFixed(3); }
+    function fmt4(v) { return parseFloat(v || 0).toFixed(4); }
+    function renderCard(m) {
+        const valid = m.valid;
+        const hcm = parseFloat(m.height_cm || 0);
+        const ocm = parseFloat(m.object_cm || -1);
+        const ppmm = parseFloat(m.pixels_per_mm || 0);
+        const diff = Math.abs((m.raw_avg || 0) - (m.raw_tare || 0));
+        let dimsHtml = '';
+        if (valid) {
+            const heightHtml = hcm > 0
+                ? `<div class="dim-value ht">${fmt1(hcm)}</div><div class="dim-sub">cm &middot; ${fmt0(hcm*10)}mm</div>`
+                : `<div class="dim-value ht" style="font-size:13px;">N/A</div>`;
+            const objHtml = ocm > 0
+                ? `<div class="dim-value d">${fmt1(ocm)}</div><div class="dim-sub">cm</div>`
+                : `<div class="dim-value d" style="font-size:13px;">N/A</div>`;
+            dimsHtml = `
+                <div class="dim-box"><div class="dim-label">Length</div><div class="dim-value w">${fmt1((m.length_mm||0)/10)}</div><div class="dim-sub">cm &middot; ${fmt0(m.length_mm||0)}mm</div></div>
+                <div class="dim-box"><div class="dim-label">Width</div><div class="dim-value h">${fmt1((m.width_mm||0)/10)}</div><div class="dim-sub">cm &middot; ${fmt0(m.width_mm||0)}mm</div></div>
+                <div class="dim-box"><div class="dim-label">Height</div>${heightHtml}</div>
+                <div class="dim-box"><div class="dim-label">Weight</div><div class="dim-value wt">${fmt0(m.weight_g)}</div><div class="dim-sub">g &middot; ${fmt3(m.weight_g/1000)}kg</div></div>
+                <div class="dim-box"><div class="dim-label">Angle</div><div class="dim-value a">${fmt1(m.angle)}&deg;</div><div class="dim-sub">rotation</div></div>
+                <div class="dim-box"><div class="dim-label">Obj Dist</div>${objHtml}</div>`;
+        } else {
+            const heightHtml = hcm > 0
+                ? `<div class="dim-value ht">${fmt1(hcm)}</div><div class="dim-sub">cm</div>`
+                : `<div class="dim-value ht" style="font-size:13px;">N/A</div>`;
+            const ultHtml = ocm > 0
+                ? `<div class="dim-value d">${fmt1(ocm)}</div><div class="dim-sub">cm</div>`
+                : `<div class="dim-value d" style="font-size:13px;">N/A</div>`;
+            dimsHtml = `
+                <div class="dim-box"><div class="dim-label">Weight</div><div class="dim-value wt">${fmt0(m.weight_g)}</div><div class="dim-sub">g &middot; ${fmt3(m.weight_g/1000)}kg</div></div>
+                <div class="dim-box"><div class="dim-label">Height</div>${heightHtml}</div>
+                <div class="dim-box"><div class="dim-label">Ultrasonic</div>${ultHtml}</div>`;
+        }
+        const noDetect = valid ? '' : `<div class="no-detect">No object detected</div>`;
+        const imgHtml = m.image ? `<img src="/files/${m.image}" alt="result">` : '';
+        const tareRow = m.tare_readings ? `<div class="raw">tare readings: ${m.tare_readings}</div>` : '';
+        const wtRow   = m.weight_readings ? `<div class="raw">weight readings: ${m.weight_readings}</div>` : '';
+        return `<div class="card">
+            ${imgHtml}
+            <div class="card-body">
+                <div class="card-hdr">
+                    <span class="card-time">${m.timestamp || ''}</span>
+                    ${valid ? '<span class="badge ok">&#10003; Detected</span>' : '<span class="badge err">&#10007; No Object</span>'}
+                </div>
+                ${noDetect}
+                <div class="dims">${dimsHtml}</div>
+                <div class="raw-grid">
+                    <div class="raw-cell"><div class="rc-lbl">Tare</div><div class="rc-val">${m.raw_tare||0}</div></div>
+                    <div class="raw-cell"><div class="rc-lbl">Avg</div><div class="rc-val">${m.raw_avg||0}</div></div>
+                    <div class="raw-cell"><div class="rc-lbl">Diff</div><div class="rc-val" style="color:var(--blue);">${diff}</div></div>
+                    <div class="raw-cell"><div class="rc-lbl">ppmm</div><div class="rc-val" style="color:var(--purple);">${ppmm > 0 ? fmt4(ppmm) : '—'}</div></div>
+                </div>
+                ${tareRow}${wtRow}
+                <div class="card-foot">
+                    <button onclick="doDelete('${m.image||''}')" class="btn btn-red" style="padding:4px 10px;font-size:11px;">&#128465; Delete</button>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    /* ── Refresh measurements grid without full page reload ── */
+    async function refreshMeasurements() {
+        const resp = await fetch(API_BASE + '/api/measurements');
+        if (!resp.ok) return null;
+        return await resp.json();
+    }
+
+    function applyMeasurements(data) {
+        const grid = document.getElementById('measureGrid');
+        const chip = document.getElementById('countChip');
+        const n = data.length;
+        if (chip) chip.innerHTML = `<b>${n}</b> measurement${n !== 1 ? 's' : ''}`;
+        if (!grid) return;
+        if (n === 0) {
+            grid.innerHTML = '<div class="empty"><span class="empty-icon">&#128202;</span>Waiting for measurements to appear...</div>';
+        } else {
+            grid.innerHTML = data.map(renderCard).join('');
+        }
+    }
+
+    /* ── Poll until new measurement arrives (max 90s) ── */
+    async function pollForNewMeasurement(prevCount) {
+        const deadline = Date.now() + 90000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 2500));
+            const data = await refreshMeasurements();
+            if (data && data.length > prevCount) {
+                applyMeasurements(data);
+                return true;
+            }
+        }
+        return false;
+    }
 
     async function doTrigger(target, extra) {
         const btnMap = {both: 'btnMeasure', camera: 'btnBaseline', weight: 'btnWeightTrigger'};
@@ -1078,6 +1219,11 @@ PAGE_TEMPLATE = """
         const result = document.getElementById(resultMap[target]);
         if (btn) { btn.disabled = true; btn.textContent = '...'; }
         if (result) result.style.display = 'none';
+
+        // Get current count before triggering
+        const before = await refreshMeasurements();
+        const prevCount = before ? before.length : 0;
+
         try {
             const body = Object.assign({target}, extra || {});
             const resp = await fetch(API_BASE + '/api/trigger', {
@@ -1086,32 +1232,32 @@ PAGE_TEMPLATE = """
                 body: JSON.stringify(body)
             });
             const data = await resp.json();
-            if (result) {
-                result.style.display = 'block';
-                if (resp.ok) {
-                    result.style.color = '#81c784';
-                    const msgs = {
-                        both: 'Measurement triggered — please wait...',
-                        camera: 'Capturing dimensions...',
-                        weight: 'Taring and weighing...'
-                    };
+            if (!resp.ok) {
+                if (result) { result.style.display = 'block'; result.style.color = '#ef5350'; result.textContent = 'Error: ' + data.message; }
+            } else if (target === 'both') {
+                showOverlay('Measuring...', 'Device is capturing dimensions and weight');
+                const got = await pollForNewMeasurement(prevCount);
+                hideOverlay();
+                if (result) {
+                    result.style.display = 'block';
+                    result.style.color = got ? '#81c784' : '#ffb74d';
+                    result.textContent = got ? 'Measurement complete.' : 'Timed out — refresh manually if needed.';
+                }
+            } else {
+                if (result) {
+                    result.style.display = 'block'; result.style.color = '#81c784';
+                    const msgs = {camera: 'Capturing dimensions...', weight: 'Taring and weighing...'};
                     result.textContent = msgs[target] || 'Triggered.';
-                } else {
-                    result.style.color = '#ef5350';
-                    result.textContent = 'Error: ' + data.message;
                 }
             }
         } catch (e) {
-            if (result) {
-                result.style.display = 'block';
-                result.style.color = '#ef5350';
-                result.textContent = 'Request failed: ' + e.message;
-            }
+            hideOverlay();
+            if (result) { result.style.display = 'block'; result.style.color = '#ef5350'; result.textContent = 'Request failed: ' + e.message; }
         }
         if (btn) {
             btn.disabled = false;
-            const labels = {btnMeasure: '\u25b6 Measure', btnBaseline: '\u8635 Re-measure Baseline', btnWeightTrigger: '\u25b6 Tare & Weigh'};
-            btn.textContent = labels[btn.id] || 'Trigger';
+            const labels = {btnMeasure: '&#9654;\u00a0 Measure Now', btnBaseline: '\u8635 Re-measure Baseline', btnWeightTrigger: '&#9654;\u00a0 Weigh'};
+            btn.innerHTML = labels[btn.id] || 'Trigger';
         }
     }
 
